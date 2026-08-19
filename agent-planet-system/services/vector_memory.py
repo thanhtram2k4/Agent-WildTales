@@ -1,0 +1,106 @@
+# services/vector_memory.py — Privacy-aware semantic vector retrieval over ChromaDB
+"""
+Provides semantic search over journal_embeddings with strict privacy enforcement:
+- Owner queries: search both public + private entries belonging to that user_id
+- Community/agent queries: search ONLY public entries (no private data leaks)
+"""
+import logging
+from typing import Optional
+
+logger = logging.getLogger("wildtails.vector_memory")
+
+
+class VectorMemory:
+    """Privacy-aware wrapper around a ChromaDB collection for semantic retrieval."""
+
+    def __init__(self, collection, embed_fn):
+        """
+        Args:
+            collection: A ChromaDB collection (journal_embeddings).
+            embed_fn: Async callable(text) -> list[float] | None.
+        """
+        self.collection = collection
+        self.embed_fn = embed_fn
+
+    async def search(
+        self,
+        query: str,
+        n_results: int = 5,
+        user_id: Optional[str] = None,
+        include_private: bool = False,
+    ) -> list[dict]:
+        """Semantic search with privacy enforcement.
+
+        Args:
+            query: Natural language search query.
+            n_results: Max results to return.
+            user_id: If provided, scopes results. Required when include_private=True.
+            include_private: If True, also return the user's private entries.
+                             Only allowed when user_id is set (owner query).
+
+        Returns:
+            List of dicts with keys: document, metadata, distance.
+        """
+        if self.collection is None:
+            logger.warning("VectorMemory.search called but collection is None")
+            return []
+
+        embedding = await self.embed_fn(query)
+        if embedding is None:
+            return []
+
+        # Build ChromaDB where filter for privacy enforcement
+        where_filter = self._build_where_filter(user_id, include_private)
+
+        try:
+            results = self.collection.query(
+                query_embeddings=[embedding],
+                n_results=n_results,
+                where=where_filter,
+            )
+        except Exception as e:
+            logger.warning("VectorMemory search failed: %s", e)
+            return []
+
+        return self._format_results(results)
+
+    def _build_where_filter(self, user_id: Optional[str], include_private: bool) -> dict:
+        """Build ChromaDB where clause enforcing privacy rules.
+
+        Rules:
+        - No user_id (community/agent): only public
+        - user_id + include_private=False: only public
+        - user_id + include_private=True: public OR (private AND owned by user_id)
+        """
+        if not include_private or not user_id:
+            # Community agents / public-only queries
+            return {"visibility": "public"}
+
+        # Owner query: public entries from anyone + private entries from this user
+        return {
+            "$or": [
+                {"visibility": "public"},
+                {"$and": [
+                    {"visibility": "private"},
+                    {"user_id": user_id},
+                ]},
+            ]
+        }
+
+    def _format_results(self, results: dict) -> list[dict]:
+        """Convert ChromaDB query results into a flat list of dicts."""
+        if not results or not results.get("documents"):
+            return []
+
+        documents = results["documents"][0]
+        metadatas = results["metadatas"][0] if results.get("metadatas") else [{}] * len(documents)
+        distances = results["distances"][0] if results.get("distances") else [0.0] * len(documents)
+
+        return [
+            {
+                "document": doc,
+                "metadata": meta,
+                "distance": dist,
+            }
+            for doc, meta, dist in zip(documents, metadatas, distances)
+        ]

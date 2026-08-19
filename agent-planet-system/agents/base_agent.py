@@ -60,11 +60,21 @@ class BaseAgent(ABC):
     # --- Shared utilities ---
 
     def fetch_recent_context(self, n: int = 10) -> str:
-        """Fetch last n public messages from backend."""
+        """Fetch last n public messages from backend.
+
+        Community agents ONLY see public scope — private (Captain's Cabin)
+        entries are never included in agent context.
+        """
         try:
-            resp = requests.get(f"{BACKEND_URL}/api/messages", timeout=5)
+            resp = requests.get(
+                f"{BACKEND_URL}/api/messages",
+                params={"scope": "public"},
+                timeout=5,
+            )
             if resp.status_code == 200:
                 messages = resp.json().get("messages", [])
+                # Double-check: filter out any non-public messages defensively
+                messages = [m for m in messages if m.get("visibility") != "private"]
                 recent = messages[-n:] if len(messages) > n else messages
                 lines = [f"[{m.get('sender', '?')}]: {m.get('content', '')}" for m in recent]
                 return "\n".join(lines)
@@ -88,17 +98,28 @@ class BaseAgent(ABC):
             logger.warning("[%s] LLM generation failed: %s", self.agent_name, e)
             return ""
 
-    def send_reply(self, message: str) -> None:
-        """Post a reply back to the backend chat timeline."""
+    def send_reply(self, message: str, user_id: str = "", conversation_id: str = "") -> None:
+        """Post a reply back to the backend chat timeline.
+
+        Args:
+            message: The reply text.
+            user_id: Target user this reply is for (from SSE event envelope).
+            conversation_id: Conversation this reply belongs to.
+        """
         if not message:
             return
         try:
             requests.post(
                 f"{BACKEND_URL}/api/external_agent_reply",
-                json={"agent_name": self.agent_name, "message": message},
+                json={
+                    "agent_name": self.agent_name,
+                    "message": message,
+                    "user_id": user_id,
+                    "conversation_id": conversation_id,
+                },
                 timeout=5,
             )
-            logger.info("[%s] Reply sent", self.agent_name)
+            logger.info("[%s] Reply sent (user=%s, conv=%s)", self.agent_name, user_id, conversation_id)
         except requests.exceptions.ConnectionError:
             logger.warning("[%s] Failed to send reply to backend", self.agent_name)
 

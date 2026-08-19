@@ -1,6 +1,6 @@
 # WildTails — Catalyst Verse: Implementation Status
 
-> MVP Feature Checklist aligned with the 4-week development proposal.
+> Complete Phase 5 implementation covering all P0, P1, and P2 tasks.
 
 **Last Updated:** 2026-08-19
 
@@ -10,97 +10,122 @@
 
 | Feature | Status | File(s) |
 |---------|--------|---------|
-| `requirements.txt` with all dependencies | ✅ Done | `requirements.txt` |
+| `requirements.txt` with all dependencies (incl. mcp) | ✅ Done | `requirements.txt` |
 | `.env.example` with default local values | ✅ Done | `.env.example` |
-| Environment-based config (OLLAMA_BASE_URL, model names) | ✅ Done | `app.py:23-26` |
+| Environment-based config | ✅ Done | `app.py` |
 | `.gitignore` shielding DB, chroma, venv, .env | ✅ Done | `.gitignore` |
 
 ## Phase B: SQLite Schema & ChromaDB
 
 | Feature | Status | File(s) |
 |---------|--------|---------|
-| `messages` table with `visibility` column (private/public) | ✅ Done | `app.py:50-58` |
-| `token_transactions` table (id, user_id, amount, reason, reference_type) | ✅ Done | `app.py:66-75` |
-| `goals` table (id, user_id, title, status, timestamps) | ✅ Done | `app.py:77-87` |
-| Safe ALTER TABLE migration for existing databases | ✅ Done | `app.py:60-64` |
-| ChromaDB persistent store at `./chroma_db` | ✅ Done | `app.py:102-118` |
-| `journal_embeddings` collection | ✅ Done | `app.py:112-114` |
-| Async `embed_text()` using nomic-embed-text | ✅ Done | `app.py:121-131` |
-| Journal embedding on `POST /api/chat` (failure-safe) | ✅ Done | `app.py:241-260` |
+| `users` table (P0-1) | ✅ Done | `app.py` |
+| `messages` table with `user_id`, `conversation_id`, `visibility` | ✅ Done | `app.py` |
+| `token_transactions` with `reference_id` (idempotency) | ✅ Done | `app.py` |
+| `goals` with `progress`, `target_date` (P1-4) | ✅ Done | `app.py` |
+| `game_rooms` table with state machine (P1-2) | ✅ Done | `app.py` |
+| Safe ALTER TABLE migrations for all new columns | ✅ Done | `app.py` |
+| ChromaDB persistent store | ✅ Done | `app.py` |
+| `journal_embeddings` collection | ✅ Done | `app.py` |
+| Async `embed_text()` | ✅ Done | `app.py` |
 
 ## Phase C: Privacy-Aware Event Bridge
 
 | Feature | Status | File(s) |
 |---------|--------|---------|
-| `visibility` field on `UserMessage` model | ✅ Done | `app.py:159-163` |
-| Private entries blocked from SSE broadcast | ✅ Done | `app.py:270-280` |
-| `GET /api/messages` scope filtering (public/owner/system) | ✅ Done | `app.py:317-353` |
-| ChromaDB entries tagged with visibility metadata | ✅ Done | `app.py:234` |
+| Private entries blocked from SSE broadcast | ✅ Done | `app.py` |
+| Owner-scoped message API (uses `user_id`) | ✅ Done | `app.py` |
+| Agent context fetch restricted to public scope | ✅ Done | `agents/base_agent.py` |
+| Bounded-queue EventBridge with disconnect handling | ✅ Done | `services/event_bridge.py` |
+| Structured SSE envelope (event_id, user_id, conversation_id) | ✅ Done | `app.py` |
 
 ## Phase D: MCP Boundary & Local RAG
 
 | Feature | Status | File(s) |
 |---------|--------|---------|
-| URL fetching with defensive parsing (timeouts, size limits) | ✅ Done | `mcp_tools.py:70-121` |
-| YouTube transcript extraction (youtube-transcript-api) | ✅ Done | `mcp_tools.py:37-67` |
-| Article extraction via BeautifulSoup | ✅ Done | `mcp_tools.py:70-121` |
-| Text chunking with word-boundary overlap | ✅ Done | `mcp_tools.py:139-159` |
-| `POST /api/knowledge/ingest` endpoint | ✅ Done | `app.py:356-409` |
+| SSRF-safe URL validation (blocks private IPs, non-http) | ✅ Done | `mcp_tools.py` |
+| URL fetching, YouTube transcripts, article extraction | ✅ Done | `mcp_tools.py` |
+| `POST /api/knowledge/ingest` | ✅ Done | `app.py` |
+| `POST /api/knowledge/search` (semantic search) | ✅ Done | `app.py` |
+| `POST /api/knowledge/ask` (RAG: retrieve + LLM) | ✅ Done | `app.py` |
+| MCP server with 3 tools (stdio transport) | ✅ Done | `mcp_server.py` |
 
-## Phase E: Wildcats Event Matcher
+## Phase E: Wildcats Event System
 
 | Feature | Status | File(s) |
 |---------|--------|---------|
-| Event fetcher from wildcats.io/event-list | ✅ Done | `services/wildcats_events.py:86-98` |
-| HTML parser (structured + heading fallback strategies) | ✅ Done | `services/wildcats_events.py:109-213` |
-| Normalized event schema (title, description, date, location, url, tags) | ✅ Done | `services/wildcats_events.py:19-29` |
-| In-memory TTL cache with auto-refresh | ✅ Done | `services/wildcats_events.py:32-84` |
-| Keyword search with ranking | ✅ Done | `services/wildcats_events.py:71-84` |
-| Local HTML fixture for offline testing | ✅ Done | `tests/fixtures/wildcats_events.html` |
-| `GET /api/events` and `POST /api/events/refresh` | ✅ Done | `app.py:520-536` |
+| Event fetcher + TTL cache | ✅ Done | `services/wildcats_events.py` |
+| HTML parser (structured + fallback) | ✅ Done | `services/wildcats_events.py` |
+| `POST /api/events/embed` (ChromaDB embedding) | ✅ Done | `app.py` |
+| `POST /api/events/match` (semantic matching) | ✅ Done | `app.py` |
+| Event Scout V2 (vector similarity, no fabrication) | ✅ Done | `agents/event_matcher.py` |
 
 ## Phase F: Multi-Persona Agent Ecosystem
 
 | Feature | Status | File(s) |
 |---------|--------|---------|
-| Reusable `BaseAgent` framework (SSE + LLM + reply) | ✅ Done | `agents/base_agent.py` |
-| Memory Keeper agent (reflective mood scope) | ✅ Done | `agents/memory_keeper.py` |
-| Discipline Boss agent (goal monitoring scope) | ✅ Done | `agents/discipline_boss.py` |
-| Gamemaster agent (trivia/RPG, sun-planet scope) | ✅ Done | `agents/gamemaster.py` |
-| Wildcats Event Scout agent (interest detection) | ✅ Done | `agents/event_matcher.py` |
-| Deterministic routing via `event_filter()` | ✅ Done | Each agent file |
-| Concurrent agent launcher | ✅ Done | `agents/run_all.py` |
-| Goals CRUD API (`POST/PUT/GET /api/goals`) | ✅ Done | `app.py:412-505` |
-| Goal reminder SSE trigger | ✅ Done | `app.py:482-505` |
+| `BaseAgent` framework with targeted `send_reply()` | ✅ Done | `agents/base_agent.py` |
+| Memory Keeper with ChromaDB semantic search | ✅ Done | `agents/memory_keeper.py` |
+| Discipline Boss with progress/deadline context | ✅ Done | `agents/discipline_boss.py` |
+| Gamemaster with backend game API integration | ✅ Done | `agents/gamemaster.py` |
+| Event Scout V2 (semantic matching) | ✅ Done | `agents/event_matcher.py` |
+| Deterministic routing (each agent has strict event_filter) | ✅ Done | All agent files |
 
-## Phase G: Gamification Integration
+## Phase G: Gamification
 
 | Feature | Status | File(s) |
 |---------|--------|---------|
-| `GET /api/tokens/{user_id}` balance endpoint | ✅ Done | `app.py:508-517` |
-| Catalyst Points display in Streamlit sidebar | ✅ Done | `ui.py` sidebar section |
+| `TokenService` with idempotent awarding | ✅ Done | `services/token_service.py` |
+| `POST /api/tokens/award` (with reference dedup) | ✅ Done | `app.py` |
+| `GET /api/tokens/{user_id}/transactions` | ✅ Done | `app.py` |
+| Trivia game loop (WAITING->IN_PROGRESS->FINISHED) | ✅ Done | `app.py` |
+| `POST /api/game/start`, `POST /api/game/answer` | ✅ Done | `app.py` |
+| Backend answer validation | ✅ Done | `app.py` |
 
 ## Phase H: Streamlit Product UI
 
 | Feature | Status | File(s) |
 |---------|--------|---------|
-| Tabbed layout (Journal / Knowledge / Goals / Events) | ✅ Done | `ui.py` |
-| Private vs Public visibility toggle | ✅ Done | `ui.py` Journal tab |
-| Agent-differentiated chat rendering (5 agents) | ✅ Done | `ui.py` AGENT_STYLE |
-| Knowledge ingestion form | ✅ Done | `ui.py` Knowledge tab |
-| Goals management + Discipline Boss trigger | ✅ Done | `ui.py` Goals tab |
-| Wildcats Events browser with refresh | ✅ Done | `ui.py` Events tab |
-| Cosmic dark theme CSS | ✅ Done | `ui.py` custom CSS |
+| 7-tab layout (Cabin/Feed/Knowledge/Lounge/Goals/Points/Events) | ✅ Done | `ui.py` |
+| Captain's Cabin clearly marked PRIVATE | ✅ Done | `ui.py` |
+| Planet Feed with auto-refresh (st.fragment) | ✅ Done | `ui.py` |
+| Knowledge Station (ingest + semantic search + RAG ask) | ✅ Done | `ui.py` |
+| Meeting Lounge (trivia game UI) | ✅ Done | `ui.py` |
+| Catalyst Points (balance + transaction history) | ✅ Done | `ui.py` |
+| Goals with progress bar + target_date | ✅ Done | `ui.py` |
+| WildTails visual identity (navy/teal/golden yellow) | ✅ Done | `ui.py` |
+| Health status indicators in sidebar | ✅ Done | `ui.py` |
 
-## Phase J: Testing Suite
+## Phase I: Privacy-Aware Vector Retrieval
 
 | Feature | Status | File(s) |
 |---------|--------|---------|
-| Privacy isolation tests (5 tests) | ✅ Done | `tests/test_privacy.py` |
-| Token ledger tests (4 tests) | ✅ Done | `tests/test_tokens.py` |
-| Mood router & fallback tests (6 tests) | ✅ Done | `tests/test_mood_router.py` |
-| Event parser & cache tests (20 tests) | ✅ Done | `tests/test_events.py` |
-| **Total: 35 tests, all passing** | ✅ Done | `pytest tests/ -v` |
+| `VectorMemory` with privacy-enforced $or filters | ✅ Done | `services/vector_memory.py` |
+| `POST /api/memory/search` (privacy-aware) | ✅ Done | `app.py` |
+| Integration tests proving private memory isolation | ✅ Done | `tests/test_integration_privacy.py` |
+
+## Phase J: API Health & Monitoring
+
+| Feature | Status | File(s) |
+|---------|--------|---------|
+| `GET /api/health` (SQLite + ChromaDB + Ollama chat + embed) | ✅ Done | `app.py` |
+| Graceful degradation indicators in UI | ✅ Done | `ui.py` sidebar |
+
+## Phase K: Testing Suite
+
+| Feature | Status | File(s) |
+|---------|--------|---------|
+| Privacy isolation tests (8) | ✅ Done | `tests/test_privacy.py` |
+| Token + idempotency tests (10) | ✅ Done | `tests/test_tokens.py` |
+| Mood router & fallback tests (6) | ✅ Done | `tests/test_mood_router.py` |
+| Event parser & cache tests (20) | ✅ Done | `tests/test_events.py` |
+| Vector memory privacy tests (6) | ✅ Done | `tests/test_vector_memory.py` |
+| RAG + URL validation tests (15) | ✅ Done | `tests/test_knowledge_rag.py` |
+| MCP tool handler tests (8) | ✅ Done | `tests/test_mcp_server.py` |
+| Game loop state machine tests (8) | ✅ Done | `tests/test_game_loop.py` |
+| Expanded goals tests (5) | ✅ Done | `tests/test_goals_expanded.py` |
+| Event bridge tests (6) | ✅ Done | `tests/test_event_bridge.py` |
+| Integration privacy proofs (5) | ✅ Done | `tests/test_integration_privacy.py` |
 
 ---
 
@@ -108,13 +133,14 @@
 
 | Metric | Value |
 |--------|-------|
-| Total API endpoints | 14 |
-| Total agents | 4 (+1 legacy) |
-| Total test cases | 35 |
-| SQLite tables | 3 (messages, token_transactions, goals) |
+| Total API endpoints | 22 |
+| Total agents | 4 |
+| Total test cases | 97+ |
+| SQLite tables | 5 (users, messages, token_transactions, goals, game_rooms) |
 | ChromaDB collections | 1 (journal_embeddings) |
-| UI tabs | 4 |
-| Python modules | 14 |
-| Lines of code (approx.) | ~1,800 |
+| UI tabs | 7 |
+| Services | 4 (event_bridge, token_service, vector_memory, wildcats_events) |
+| MCP tools | 3 (ingest_url, search_knowledge, get_wildcats_events) |
+| Test files | 11 |
 
-**All MVP features from the 4-week proposal are implemented and tested.**
+**All Phase 5 P0/P1/P2 tasks are implemented and tested.**

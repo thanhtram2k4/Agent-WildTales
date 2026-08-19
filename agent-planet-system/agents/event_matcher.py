@@ -1,9 +1,10 @@
-# agents/event_matcher.py — Wildcats Event Matcher Agent
-# Scope: Detects user interests from SSE events, recommends matching Wildcats events
+# agents/event_matcher.py — Wildcats Event Matcher Agent V2
+# Scope: Semantic matching of user interests against embedded Wildcats events
+# Returns ONLY real event data (title, URL, date) — never fabricates events
 import logging
 
-from agents.base_agent import BaseAgent
-from services.wildcats_events import event_cache
+import requests
+from agents.base_agent import BaseAgent, BACKEND_URL
 
 logger = logging.getLogger("wildtails.agents.event_matcher")
 
@@ -23,82 +24,65 @@ class EventMatcherAgent(BaseAgent):
             "2. Giới thiệu 1-2 sự kiện phù hợp nhất từ danh sách Wildcats.\n"
             "3. Giải thích ngắn gọn vì sao sự kiện này phù hợp với họ.\n"
             "Phản hồi bằng tiếng Việt, ngắn gọn (3-4 câu). "
-            "Format tên sự kiện rõ ràng, kèm ngày và link nếu có."
+            "Format tên sự kiện rõ ràng, kèm ngày và link nếu có.\n"
+            "QUAN TRỌNG: CHỈ giới thiệu sự kiện từ dữ liệu được cung cấp. KHÔNG bịa ra sự kiện."
         )
 
     def event_filter(self, data: dict) -> bool:
-        """Handle EVENT_MATCH_REQUEST and public NEW_USER_JOINED events."""
-        event_type = data.get("type", "")
-        return event_type in ("EVENT_MATCH_REQUEST", "NEW_USER_JOINED")
+        """Handle ONLY EVENT_MATCH_REQUEST events.
+
+        Deterministic routing: this agent no longer responds to every
+        NEW_USER_JOINED event (which caused spam). It only activates on
+        explicit event match requests.
+        """
+        return data.get("type") == "EVENT_MATCH_REQUEST"
 
     def handle_event(self, data: dict) -> None:
         user_name = data.get("user", "bạn")
-        event_type = data.get("type")
-
-        # Build interest query from event context
-        if event_type == "EVENT_MATCH_REQUEST":
-            query = data.get("query", "")
-        else:
-            # For NEW_USER_JOINED, derive interests from recent context
-            context = self.fetch_recent_context(n=5)
-            query = self._extract_interests(context, data)
+        user_id = data.get("user_id", "")
+        conversation_id = data.get("conversation_id", "")
+        query = data.get("query", "")
 
         if not query:
             return
 
-        # Search event cache (uses fixture in tests, live in production)
-        matching_events = event_cache.get_events(use_fixture=False)
-        if not matching_events:
-            # Fallback to fixture if live fetch returns nothing
-            matching_events = event_cache.get_events(use_fixture=True)
-
-        results = event_cache.search(query, top_k=2)
-        if not results:
+        # Use semantic matching API to find relevant events
+        matches = self._semantic_match(query)
+        if not matches:
             return
 
-        # Format event recommendations
+        # Format real event data for the LLM prompt
         events_text = ""
-        for i, ev in enumerate(results, 1):
+        for i, ev in enumerate(matches, 1):
             events_text += (
-                f"\n{i}. {ev.title}"
-                f"\n   Ngày: {ev.event_date or 'TBD'}"
-                f"\n   Địa điểm: {ev.location or 'Online'}"
-                f"\n   Link: {ev.event_url or 'N/A'}"
-                f"\n   Mô tả: {ev.description[:100]}"
+                f"\n{i}. {ev['title']}"
+                f"\n   Ngày: {ev.get('event_date') or 'TBD'}"
+                f"\n   Địa điểm: {ev.get('location') or 'Online'}"
+                f"\n   Link: {ev.get('event_url') or 'N/A'}"
+                f"\n   Tags: {ev.get('tags', '')}"
             )
 
         prompt = (
-            f"Người dùng '{user_name}' có vẻ quan tâm đến: {query}\n"
-            f"Các sự kiện phù hợp từ Wildcats:\n{events_text}\n\n"
-            "Hãy giới thiệu sự kiện phù hợp nhất một cách tự nhiên và hấp dẫn."
+            f"Người dùng '{user_name}' đang quan tâm đến: {query}\n"
+            f"Các sự kiện Wildcats phù hợp nhất:\n{events_text}\n\n"
+            "Hãy giới thiệu sự kiện phù hợp nhất một cách tự nhiên và hấp dẫn.\n"
+            "CHỈ sử dụng thông tin sự kiện ở trên. KHÔNG bịa thêm sự kiện."
         )
 
         reply = self.generate_reply(prompt)
         if reply:
-            self.send_reply(reply)
+            self.send_reply(reply, user_id=user_id, conversation_id=conversation_id)
 
-    def _extract_interests(self, context: str, data: dict) -> str:
-        """Derive search keywords from chat context and event metadata."""
-        planet = data.get("planet", "")
-        message = data.get("message", "")
-
-        keywords = []
-        # Planet-based hints
-        if planet == "Vườn kỷ niệm":
-            keywords.extend(["wellness", "writing", "mindfulness"])
-        elif planet == "Hành tinh mặt trời":
-            keywords.extend(["gaming", "hackathon", "networking"])
-
-        # Extract key nouns from recent context (simple heuristic)
-        interest_signals = [
-            "code", "coding", "lập trình", "AI", "game", "gaming",
-            "viết", "writing", "sáng tạo", "creative",
-            "startup", "kinh doanh", "business",
-            "wellness", "sức khỏe", "mindfulness",
-        ]
-        combined_text = f"{context} {message}".lower()
-        for signal in interest_signals:
-            if signal.lower() in combined_text:
-                keywords.append(signal)
-
-        return " ".join(set(keywords)) if keywords else ""
+    def _semantic_match(self, query: str, n_results: int = 2) -> list[dict]:
+        """Call the backend semantic event matching API."""
+        try:
+            resp = requests.post(
+                f"{BACKEND_URL}/api/events/match",
+                json={"query": query, "n_results": n_results},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                return resp.json().get("matches", [])
+        except Exception as e:
+            logger.warning("[EventMatcher] Semantic match failed: %s", e)
+        return []

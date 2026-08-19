@@ -1,6 +1,12 @@
 # agents/memory_keeper.py — "Người giữ kỷ niệm" (Memory Keeper)
 # Scope: Responds to reflective/sad mood entries routed to "Vườn kỷ niệm"
-from agents.base_agent import BaseAgent
+# Uses ChromaDB semantic search to find relevant past memories
+import logging
+
+import requests
+from agents.base_agent import BaseAgent, BACKEND_URL
+
+logger = logging.getLogger("wildtails.agents.memory_keeper")
 
 
 class MemoryKeeperAgent(BaseAgent):
@@ -27,16 +33,57 @@ class MemoryKeeperAgent(BaseAgent):
             and data.get("planet") == "Vườn kỷ niệm"
         )
 
+    def _fetch_semantic_memories(self, query: str, n_results: int = 5) -> str:
+        """Query ChromaDB via the backend API for relevant public memories.
+
+        Community agents only search public entries — private journals
+        are never exposed to agents.
+        """
+        try:
+            resp = requests.post(
+                f"{BACKEND_URL}/api/memory/search",
+                json={
+                    "query": query,
+                    "n_results": n_results,
+                    "user_id": "",
+                    "include_private": False,
+                },
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                results = resp.json().get("results", [])
+                if results:
+                    lines = []
+                    for r in results:
+                        user = r.get("metadata", {}).get("user_name", "ai đó")
+                        lines.append(f"[{user}]: {r['document']}")
+                    return "\n".join(lines)
+        except Exception as e:
+            logger.warning("[%s] Semantic memory search failed: %s", self.agent_name, e)
+        return ""
+
     def handle_event(self, data: dict) -> None:
         user_name = data.get("user", "bạn")
-        context = self.fetch_recent_context(n=10)
+        user_id = data.get("user_id", "")
+        conversation_id = data.get("conversation_id", "")
+        message = data.get("message", "")
+
+        # Try semantic search first — find memories related to the user's current message
+        search_query = message or f"{user_name} buồn hoài niệm Vườn kỷ niệm"
+        semantic_memories = self._fetch_semantic_memories(search_query, n_results=5)
+
+        # Fall back to recent chat context if no semantic results
+        if not semantic_memories:
+            semantic_memories = self.fetch_recent_context(n=10)
 
         prompt = f"Người dùng tên '{user_name}' vừa bước vào Vườn kỷ niệm với tâm trạng buồn/hoài niệm."
-        if context:
-            prompt += f"\n\nHội thoại gần đây:\n---\n{context}\n---"
-        prompt += "\nHãy chào đón họ với sự đồng cảm."
+        if semantic_memories:
+            prompt += f"\n\nKý ức liên quan từ cộng đồng:\n---\n{semantic_memories}\n---"
+            prompt += "\nHãy chào đón họ với sự đồng cảm, và nếu phù hợp, chia sẻ ký ức cộng đồng để tạo sự đồng điệu."
+        else:
+            prompt += "\nHãy chào đón họ với sự đồng cảm."
 
         greeting = self.generate_reply(prompt)
         if not greeting:
             greeting = f"Chào {user_name}, mình là Người giữ kỷ niệm. Rất vui được gặp bạn tại Vườn kỷ niệm!"
-        self.send_reply(greeting)
+        self.send_reply(greeting, user_id=user_id, conversation_id=conversation_id)

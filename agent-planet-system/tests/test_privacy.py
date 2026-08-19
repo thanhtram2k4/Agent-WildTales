@@ -72,7 +72,7 @@ async def test_private_message_visible_to_owner(mock_ollama, mock_embed):
             "message": "Private thoughts", "visibility": "private",
         })
 
-        resp = await client.get("/api/messages", params={"scope": "owner:Mina"})
+        resp = await client.get("/api/messages", params={"scope": "owner:u1"})
         assert resp.status_code == 200
         messages = resp.json()["messages"]
         contents = [m["content"] for m in messages]
@@ -91,7 +91,7 @@ async def test_private_message_not_visible_to_other_owner(mock_ollama, mock_embe
             "message": "Mina secret", "visibility": "private",
         })
 
-        resp = await client.get("/api/messages", params={"scope": "owner:Lan"})
+        resp = await client.get("/api/messages", params={"scope": "owner:u2"})
         messages = resp.json()["messages"]
         contents = [m["content"] for m in messages]
         assert "Mina secret" not in contents
@@ -121,6 +121,75 @@ async def test_system_scope_sees_everything(mock_ollama, mock_embed):
 
 
 @pytest.mark.asyncio
+async def test_private_message_does_not_trigger_sse(mock_ollama, mock_embed):
+    """Private entries must NEVER broadcast SSE events to agents."""
+    from app import app, subscribers
+    import asyncio
+
+    transport = ASGITransport(app=app)
+    # Set up a spy queue to capture SSE events
+    spy_queue = asyncio.Queue()
+    subscribers.append(spy_queue)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.post("/api/chat", json={
+                "user_id": "u1", "user_name": "Mina",
+                "message": "Super secret private entry", "visibility": "private",
+            })
+
+        # Queue must remain empty — no SSE was broadcast
+        assert spy_queue.empty(), "Private message triggered SSE broadcast!"
+    finally:
+        subscribers.remove(spy_queue)
+
+
+@pytest.mark.asyncio
+async def test_public_message_does_trigger_sse(mock_ollama, mock_embed):
+    """Public entries SHOULD broadcast SSE events."""
+    from app import app, subscribers
+    import asyncio
+
+    transport = ASGITransport(app=app)
+    spy_queue = asyncio.Queue()
+    subscribers.append(spy_queue)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.post("/api/chat", json={
+                "user_id": "u1", "user_name": "Mina",
+                "message": "Hello planet!", "visibility": "public",
+            })
+
+        assert not spy_queue.empty(), "Public message did NOT trigger SSE broadcast!"
+    finally:
+        subscribers.remove(spy_queue)
+
+
+@pytest.mark.asyncio
+async def test_agent_context_excludes_private_messages(mock_ollama, mock_embed):
+    """Agent context (public scope) must never include private messages."""
+    from app import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Create a private and a public message
+        await client.post("/api/chat", json={
+            "user_id": "u1", "user_name": "Mina",
+            "message": "Private journal secret", "visibility": "private",
+        })
+        await client.post("/api/chat", json={
+            "user_id": "u1", "user_name": "Mina",
+            "message": "Public hello", "visibility": "public",
+        })
+
+        # Agents use public scope
+        resp = await client.get("/api/messages", params={"scope": "public"})
+        messages = resp.json()["messages"]
+        contents = [m["content"] for m in messages]
+        assert "Private journal secret" not in contents
+        assert "Public hello" in contents
+
+
+@pytest.mark.asyncio
 async def test_public_message_visible_everywhere(mock_ollama, mock_embed):
     """A public message should appear in all scopes."""
     from app import app
@@ -132,7 +201,7 @@ async def test_public_message_visible_everywhere(mock_ollama, mock_embed):
             "message": "Hello world", "visibility": "public",
         })
 
-        for scope in ["public", "owner:Mina", "owner:Lan", "system"]:
+        for scope in ["public", "owner:u1", "owner:u2", "system"]:
             resp = await client.get("/api/messages", params={"scope": scope})
             contents = [m["content"] for m in resp.json()["messages"]]
             assert "Hello world" in contents, f"Missing in scope={scope}"

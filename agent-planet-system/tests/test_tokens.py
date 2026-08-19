@@ -88,3 +88,130 @@ async def test_user_isolation():
         r2 = await client.get("/api/tokens/u2")
         assert r1.json()["balance"] == 100
         assert r2.json()["balance"] == 5
+
+
+# --- Token Award Endpoint Tests ---
+
+@pytest.mark.asyncio
+async def test_award_tokens_via_api():
+    """POST /api/tokens/award should create a transaction and return balance."""
+    from app import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/api/tokens/award", json={
+            "user_id": "u1",
+            "amount": 10,
+            "reason": "trivia_correct",
+            "reference_type": "trivia",
+            "reference_id": "q001",
+        })
+        data = resp.json()
+        assert data["status"] == "awarded"
+        assert data["balance"] == 10
+
+
+@pytest.mark.asyncio
+async def test_award_idempotency():
+    """Duplicate award with same reference should return 'duplicate' and not add tokens."""
+    from app import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # First award
+        resp1 = await client.post("/api/tokens/award", json={
+            "user_id": "u1",
+            "amount": 10,
+            "reason": "trivia_correct",
+            "reference_type": "trivia",
+            "reference_id": "q001",
+        })
+        assert resp1.json()["status"] == "awarded"
+        assert resp1.json()["balance"] == 10
+
+        # Duplicate award — same reference
+        resp2 = await client.post("/api/tokens/award", json={
+            "user_id": "u1",
+            "amount": 10,
+            "reason": "trivia_correct",
+            "reference_type": "trivia",
+            "reference_id": "q001",
+        })
+        assert resp2.json()["status"] == "duplicate"
+        assert resp2.json()["balance"] == 10  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_award_different_reference_ids_allowed():
+    """Different reference_ids for the same type should both be awarded."""
+    from app import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/api/tokens/award", json={
+            "user_id": "u1", "amount": 5, "reason": "trivia",
+            "reference_type": "trivia", "reference_id": "q001",
+        })
+        await client.post("/api/tokens/award", json={
+            "user_id": "u1", "amount": 5, "reason": "trivia",
+            "reference_type": "trivia", "reference_id": "q002",
+        })
+
+        resp = await client.get("/api/tokens/u1")
+        assert resp.json()["balance"] == 10
+
+
+@pytest.mark.asyncio
+async def test_award_without_reference_not_idempotent():
+    """Awards without reference_type/reference_id should always go through (no idempotency)."""
+    from app import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/api/tokens/award", json={
+            "user_id": "u1", "amount": 5, "reason": "bonus",
+        })
+        await client.post("/api/tokens/award", json={
+            "user_id": "u1", "amount": 5, "reason": "bonus",
+        })
+
+        resp = await client.get("/api/tokens/u1")
+        assert resp.json()["balance"] == 10  # both went through
+
+
+# --- Transaction History Tests ---
+
+@pytest.mark.asyncio
+async def test_transaction_history():
+    """GET /api/tokens/{user_id}/transactions should return history."""
+    from app import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/api/tokens/award", json={
+            "user_id": "u1", "amount": 10, "reason": "quest_complete",
+            "reference_type": "quest", "reference_id": "quest_1",
+        })
+        await client.post("/api/tokens/award", json={
+            "user_id": "u1", "amount": -3, "reason": "rpg_loss",
+        })
+
+        resp = await client.get("/api/tokens/u1/transactions")
+        data = resp.json()
+        assert data["user_id"] == "u1"
+        assert len(data["transactions"]) == 2
+        # Most recent first
+        assert data["transactions"][0]["amount"] == -3
+        assert data["transactions"][1]["amount"] == 10
+
+
+@pytest.mark.asyncio
+async def test_empty_transaction_history():
+    """New user should have empty transaction history."""
+    from app import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/tokens/u_new/transactions")
+        data = resp.json()
+        assert data["transactions"] == []

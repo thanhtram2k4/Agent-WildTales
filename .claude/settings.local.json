@@ -9,7 +9,9 @@
       "Bash(python -m pytest tests/ -v --tb=short)",
       "Bash(python -m pytest tests/ -v)",
       "Bash(python -c \" import ast with open\\('app.py', encoding='utf-8'\\) as f: tree = ast.parse\\(f.read\\(\\)\\) for node in ast.walk\\(tree\\): if isinstance\\(node, ast.AsyncFunctionDef\\): for dec in node.decorator_list: if isinstance\\(dec, ast.Call\\) and hasattr\\(dec.func, 'attr'\\): print\\(f' {dec.func.attr.upper\\(\\):6s} {node.name}'\\) \")",
-      "Bash(python -m pytest tests/ --collect-only -q)"
+      "Bash(python -m pytest tests/ --collect-only -q)",
+      "Bash(python -c \"import mcp; print\\(mcp.__version__\\)\")",
+      "Bash(python:*)"
     ]
   }
 }

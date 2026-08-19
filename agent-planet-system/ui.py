@@ -6,8 +6,9 @@ import requests
 API_URL = "http://127.0.0.1:8000"
 USER_ID = "u1"
 USER_NAME = "Mina"
+SSE_POLL_INTERVAL = 3  # seconds between message polls
 
-# Agent display config: sender_name -> (emoji, color label)
+# Agent display config: sender_name -> (emoji, label)
 AGENT_STYLE = {
     "System Agent":          ("🛰️", "System Agent"),
     "Người giữ kỷ niệm":    ("🌸", "Memory Keeper"),
@@ -22,24 +23,21 @@ st.set_page_config(
     layout="wide",
 )
 
-# --- Custom CSS ---
+# --- WildTails Visual Identity: Navy / Teal / Golden Yellow ---
 st.markdown("""
 <style>
-    /* Cosmic dark sidebar accents */
+    /* Cosmic dark sidebar — navy base */
     [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #0d1117 0%, #161b22 100%);
+        background: linear-gradient(180deg, #0b1628 0%, #132240 60%, #1a2d50 100%);
     }
-    [data-testid="stSidebar"] * {
-        color: #c9d1d9 !important;
-    }
+    [data-testid="stSidebar"] * { color: #c9d1d9 !important; }
     [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2,
-    [data-testid="stSidebar"] h3 {
-        color: #58a6ff !important;
-    }
-    /* Token badge */
+    [data-testid="stSidebar"] h3 { color: #4dd0c8 !important; }  /* teal headings */
+
+    /* Token badge — golden yellow gradient */
     .token-badge {
-        background: linear-gradient(135deg, #f0c27f, #fc5c7d);
-        color: #1a1a2e !important;
+        background: linear-gradient(135deg, #f5c842, #e6a817);
+        color: #0b1628 !important;
         padding: 8px 16px;
         border-radius: 20px;
         font-weight: 700;
@@ -47,37 +45,45 @@ st.markdown("""
         text-align: center;
         margin: 8px 0;
     }
-    /* Planet indicator */
+    /* Planet indicators */
     .planet-indicator {
-        padding: 6px 12px;
-        border-radius: 12px;
-        font-weight: 600;
-        text-align: center;
-        margin: 4px 0;
+        padding: 6px 12px; border-radius: 12px;
+        font-weight: 600; text-align: center; margin: 4px 0;
     }
     .planet-sun {
-        background: linear-gradient(135deg, #ff9a56, #ff6a00);
-        color: #fff !important;
+        background: linear-gradient(135deg, #f5c842, #e6a817);
+        color: #0b1628 !important;
     }
     .planet-garden {
-        background: linear-gradient(135deg, #56ab2f, #a8e063);
-        color: #1a1a2e !important;
+        background: linear-gradient(135deg, #4dd0c8, #2da89e);
+        color: #0b1628 !important;
     }
     /* Goal status pills */
-    .goal-active { color: #58a6ff; font-weight: 600; }
+    .goal-active { color: #4dd0c8; font-weight: 600; }
     .goal-done { color: #3fb950; font-weight: 600; }
     .goal-dropped { color: #8b949e; text-decoration: line-through; }
+    /* Private banner */
+    .private-banner {
+        background: linear-gradient(135deg, #2d1b4e, #1a1040);
+        color: #d4a5ff !important;
+        padding: 10px 16px; border-radius: 8px;
+        border-left: 4px solid #9b59b6;
+        margin-bottom: 12px;
+    }
+    /* Health status */
+    .health-ok { color: #3fb950; }
+    .health-warn { color: #f5c842; }
+    .health-err { color: #f85149; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- Session State Init ---
-if "planet" not in st.session_state:
-    st.session_state.planet = ""
-if "mood" not in st.session_state:
-    st.session_state.mood = ""
+# --- Session State ---
+for key, default in [("planet", ""), ("mood", ""), ("last_msg_count", 0), ("auto_refresh", True)]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
-# --- Helper functions ---
+# --- Helpers ---
 def api_get(path, params=None, timeout=5):
     try:
         r = requests.get(f"{API_URL}{path}", params=params, timeout=timeout)
@@ -116,13 +122,34 @@ def get_planet_html(planet: str) -> str:
     return f'<div class="planet-indicator">🪐 {planet}</div>'
 
 
+def render_chat_messages(messages, show_private=True):
+    """Render a list of chat messages."""
+    for msg in messages:
+        role = msg.get("role", "assistant")
+        sender = msg.get("sender", "")
+        content = msg.get("content", "")
+        msg_vis = msg.get("visibility", "public")
+
+        if not show_private and msg_vis == "private":
+            continue
+
+        with st.chat_message(role):
+            if role == "user":
+                prefix = "🔒 " if msg_vis == "private" else ""
+                st.markdown(f"{prefix}{content}")
+            elif sender in AGENT_STYLE:
+                emoji, label = AGENT_STYLE[sender]
+                st.markdown(f"**{emoji} {label}:** {content}")
+            else:
+                st.markdown(f"**🤖 {sender}:** {content}")
+
+
 # ==================== SIDEBAR ====================
 with st.sidebar:
     st.markdown("## 🪐 WildTails")
     st.caption("Catalyst Verse — Multi-Agent Journal")
     st.divider()
 
-    # Avatar + Name
     st.image(
         f"https://api.dicebear.com/7.x/notionists/svg?seed={USER_NAME}&backgroundColor=b6e3f4",
         width=90,
@@ -136,8 +163,7 @@ with st.sidebar:
 
     st.divider()
 
-    # Current status
-    st.markdown("#### Status")
+    # Status
     if st.session_state.mood:
         st.markdown(f"**Mood:** {st.session_state.mood}")
     else:
@@ -150,165 +176,281 @@ with st.sidebar:
 
     st.divider()
 
-    # Refresh button
-    if st.button("🔄 Refresh Messages", use_container_width=True):
-        st.rerun()
+    # Health check
+    health = api_get("/api/health")
+    if health:
+        services = health.get("services", {})
+        for svc, info in services.items():
+            status_class = "health-ok" if info.get("ok") else "health-err"
+            icon = "●" if info.get("ok") else "○"
+            st.markdown(f'<span class="{status_class}">{icon}</span> {svc}', unsafe_allow_html=True)
+    else:
+        st.markdown('<span class="health-err">○</span> Backend offline', unsafe_allow_html=True)
 
-    st.caption("Agents connected via SSE event bridge")
+    st.divider()
+
+    st.session_state.auto_refresh = st.toggle("Auto-refresh", value=st.session_state.auto_refresh)
+    if st.button("🔄 Refresh", use_container_width=True):
+        st.rerun()
 
 
 # ==================== MAIN CONTENT ====================
 st.markdown("# 🪐 WildTails — Catalyst Verse")
 
-tab_journal, tab_knowledge, tab_goals, tab_events = st.tabs([
-    "📝 Journaling Space",
-    "📚 Knowledge Ingestion",
+tab_cabin, tab_feed, tab_knowledge, tab_lounge, tab_goals, tab_points, tab_events = st.tabs([
+    "🔒 Captain's Cabin",
+    "🌍 Planet Feed",
+    "📚 Knowledge Station",
+    "🎮 Meeting Lounge",
     "🎯 Goals & Tasks",
+    "⚡ Catalyst Points",
     "🗓️ Wildcats Events",
 ])
 
 
-# ===================== TAB 1: JOURNALING SPACE =====================
-with tab_journal:
-    # Visibility toggle
-    col_mode, col_spacer = st.columns([2, 3])
-    with col_mode:
-        visibility = st.radio(
-            "Journal Mode",
-            ["🌍 Planet Feed (Public)", "🔒 Captain's Cabin (Private)"],
-            horizontal=True,
-            label_visibility="collapsed",
-        )
-    vis_value = "private" if "Private" in visibility else "public"
+# ===================== TAB 1: CAPTAIN'S CABIN (PRIVATE) =====================
+with tab_cabin:
+    st.markdown('<div class="private-banner">🔒 <b>Captain\'s Cabin</b> — Everything here is PRIVATE. '
+                'Your entries will NOT be shared with agents or the community.</div>', unsafe_allow_html=True)
 
-    if vis_value == "private":
-        st.info("Captain's Cabin mode — your entry stays private and will NOT be shared with other agents.")
-    else:
-        st.success("Planet Feed mode — your entry will be visible to the agent ecosystem.")
-
-    st.divider()
-
-    # Fetch message history (owner scope to see own private messages)
+    # Fetch only private messages for this user
     messages = []
-    msg_data = api_get("/api/messages", params={"scope": f"owner:{USER_NAME}"})
+    msg_data = api_get("/api/messages", params={"scope": f"owner:{USER_ID}"})
     if msg_data:
-        messages = msg_data.get("messages", [])
+        all_msgs = msg_data.get("messages", [])
+        messages = [m for m in all_msgs if m.get("visibility") == "private"]
 
     if not messages:
-        st.caption("No messages yet. Write your first journal entry below!")
+        st.caption("Your private journal is empty. Write your first private entry below.")
 
-    # Chat history rendering
-    for msg in messages:
-        role = msg.get("role", "assistant")
-        sender = msg.get("sender", "")
-        content = msg.get("content", "")
-        msg_vis = msg.get("visibility", "public")
+    render_chat_messages(messages)
 
-        with st.chat_message(role):
-            if role == "user":
-                prefix = "🔒 " if msg_vis == "private" else ""
-                st.markdown(f"{prefix}{content}")
-            elif sender in AGENT_STYLE:
-                emoji, label = AGENT_STYLE[sender]
-                st.markdown(f"**{emoji} {label}:** {content}")
-            else:
-                st.markdown(f"**🤖 {sender}:** {content}")
-
-    # Chat input
-    if prompt := st.chat_input("Hom nay ban cam thay the nao?... (How are you feeling today?)"):
+    if prompt := st.chat_input("Write privately... (only you can see this)", key="cabin_input"):
         with st.chat_message("user"):
-            prefix = "🔒 " if vis_value == "private" else ""
-            st.markdown(f"{prefix}{prompt}")
+            st.markdown(f"🔒 {prompt}")
+
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            placeholder.markdown("Processing... ⏳")
+
+            result = api_post("/api/chat", {
+                "user_id": USER_ID, "user_name": USER_NAME,
+                "message": prompt, "visibility": "private",
+            })
+
+            if result:
+                st.session_state.planet = result.get("assigned_planet", "")
+                st.session_state.mood = result.get("mood", "")
+                placeholder.markdown(f"**🛰️ System Agent:** {result.get('agent_reply', 'Saved.')}")
+                st.rerun()
+            else:
+                placeholder.error("Cannot connect to Backend.")
+
+
+# ===================== TAB 2: PLANET FEED (PUBLIC) =====================
+with tab_feed:
+    st.markdown("Public journal entries visible to the agent ecosystem.")
+
+    messages = []
+    msg_data = api_get("/api/messages", params={"scope": f"owner:{USER_ID}"})
+    if msg_data:
+        all_msgs = msg_data.get("messages", [])
+        messages = [m for m in all_msgs if m.get("visibility") == "public"]
+
+    current_msg_count = len(messages)
+    if st.session_state.auto_refresh and current_msg_count > st.session_state.last_msg_count and st.session_state.last_msg_count > 0:
+        st.toast("New agent reply received!", icon="🤖")
+    st.session_state.last_msg_count = current_msg_count
+
+    if not messages:
+        st.caption("No public entries yet.")
+
+    render_chat_messages(messages, show_private=False)
+
+    if prompt := st.chat_input("Share with the planet... (agents will respond)", key="feed_input"):
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
         with st.chat_message("assistant"):
             placeholder = st.empty()
             placeholder.markdown("Connecting to AI brain (Ollama)... ⏳")
 
             result = api_post("/api/chat", {
-                "user_id": USER_ID,
-                "user_name": USER_NAME,
-                "message": prompt,
-                "visibility": vis_value,
+                "user_id": USER_ID, "user_name": USER_NAME,
+                "message": prompt, "visibility": "public",
             })
 
             if result:
                 st.session_state.planet = result.get("assigned_planet", "")
                 st.session_state.mood = result.get("mood", "")
-                reply = result.get("agent_reply", "Message received.")
-                placeholder.markdown(f"**🛰️ System Agent:** {reply}")
+                placeholder.markdown(f"**🛰️ System Agent:** {result.get('agent_reply', 'Message received.')}")
                 st.rerun()
             else:
-                placeholder.error(
-                    "Cannot connect to Backend. Make sure `python app.py` is running."
-                )
+                placeholder.error("Cannot connect to Backend. Make sure `python app.py` is running.")
+
+    # Auto-refresh
+    if st.session_state.auto_refresh:
+        @st.fragment(run_every=SSE_POLL_INTERVAL)
+        def _poll_for_updates():
+            data = api_get("/api/messages", params={"scope": f"owner:{USER_ID}"})
+            if data:
+                pub_msgs = [m for m in data.get("messages", []) if m.get("visibility") == "public"]
+                if len(pub_msgs) > st.session_state.last_msg_count:
+                    st.session_state.last_msg_count = len(pub_msgs)
+                    st.rerun()
+
+        _poll_for_updates()
 
 
-# ===================== TAB 2: KNOWLEDGE INGESTION =====================
+# ===================== TAB 3: KNOWLEDGE STATION =====================
 with tab_knowledge:
-    st.markdown("### 📚 Knowledge Auto-Log")
-    st.markdown(
-        "Paste a URL (article, YouTube video, blog post) to extract and embed its content "
-        "into your knowledge base for semantic search."
-    )
+    st.markdown("### 📚 Knowledge Station")
 
-    with st.form("ingest_form", clear_on_submit=True):
-        url_input = st.text_input(
-            "URL",
-            placeholder="https://example.com/article or https://youtube.com/watch?v=...",
-        )
-        submitted = st.form_submit_button("Ingest Knowledge", use_container_width=True)
+    ingest_col, search_col = st.columns(2)
 
-    if submitted and url_input:
-        with st.spinner("Fetching, chunking, and embedding content..."):
-            result = api_post("/api/knowledge/ingest", {
-                "url": url_input,
-                "user_id": USER_ID,
-                "user_name": USER_NAME,
-            })
-
-        if result and result.get("status") == "success":
-            st.success(
-                f"**{result['title']}** ingested successfully!  \n"
-                f"Source: `{result['source_type']}` | "
-                f"Chunks: {result['stored_chunks']}/{result['total_chunks']} embedded"
+    with ingest_col:
+        st.markdown("**Ingest a URL**")
+        with st.form("ingest_form", clear_on_submit=True):
+            url_input = st.text_input(
+                "URL", placeholder="https://example.com/article",
+                label_visibility="collapsed",
             )
-        elif result:
-            st.error(f"Ingestion failed: {result.get('detail', 'Unknown error')}")
+            submitted = st.form_submit_button("Ingest", use_container_width=True)
+
+        if submitted and url_input:
+            with st.spinner("Fetching, chunking, and embedding..."):
+                result = api_post("/api/knowledge/ingest", {
+                    "url": url_input, "user_id": USER_ID, "user_name": USER_NAME,
+                })
+            if result and result.get("status") == "success":
+                st.success(
+                    f"**{result['title']}** ingested!  \n"
+                    f"`{result['source_type']}` | {result['stored_chunks']}/{result['total_chunks']} chunks"
+                )
+            elif result:
+                st.error(f"Failed: {result.get('detail', 'Unknown error')}")
+            else:
+                st.error("Backend unavailable.")
+        elif submitted:
+            st.warning("Enter a URL.")
+
+    with search_col:
+        st.markdown("**Semantic Search**")
+        with st.form("search_form", clear_on_submit=False):
+            search_query = st.text_input(
+                "Search", placeholder="What do you want to find?",
+                label_visibility="collapsed",
+            )
+            search_submitted = st.form_submit_button("Search", use_container_width=True)
+
+        if search_submitted and search_query:
+            with st.spinner("Searching knowledge base..."):
+                result = api_post("/api/knowledge/search", {
+                    "query": search_query, "n_results": 5,
+                })
+            if result and result.get("results"):
+                for r in result["results"]:
+                    meta = r.get("metadata", {})
+                    title = meta.get("title", "Untitled")
+                    st.markdown(f"**{title}** (distance: {r.get('distance', 0):.3f})")
+                    st.caption(r.get("document", "")[:200])
+                    st.divider()
+            elif result:
+                st.info("No results found.")
+            else:
+                st.error("Backend unavailable.")
+
+    st.divider()
+    st.markdown("**Ask a Question (RAG)**")
+    with st.form("ask_form", clear_on_submit=False):
+        ask_query = st.text_input(
+            "Question", placeholder="Ask anything about ingested knowledge...",
+            label_visibility="collapsed",
+        )
+        ask_submitted = st.form_submit_button("Ask", use_container_width=True)
+
+    if ask_submitted and ask_query:
+        with st.spinner("Retrieving and generating answer..."):
+            result = api_post("/api/knowledge/ask", {"question": ask_query})
+        if result and result.get("answer"):
+            st.markdown(f"**Answer:** {result['answer']}")
+            if result.get("sources"):
+                st.caption("Sources: " + ", ".join(
+                    s.get("title", "?") for s in result["sources"] if s.get("title")
+                ))
         else:
-            st.error("Cannot connect to Backend.")
-    elif submitted:
-        st.warning("Please enter a URL.")
+            st.info("Could not generate an answer.")
 
 
-# ===================== TAB 3: GOALS & TASKS =====================
+# ===================== TAB 4: MEETING LOUNGE (TRIVIA) =====================
+with tab_lounge:
+    st.markdown("### 🎮 Meeting Lounge — Trivia Challenge")
+
+    # Check for active game
+    active_game = api_get(f"/api/game/{USER_ID}/active")
+
+    if active_game and active_game.get("active"):
+        room_id = active_game["room_id"]
+        question = active_game["question"]
+        reward = active_game["reward"]
+
+        st.info(f"**Active Game (Room #{room_id})** — {reward} ⚡ at stake!")
+        st.markdown(f"**Question:** {question}")
+
+        with st.form("answer_form", clear_on_submit=True):
+            answer_input = st.text_input("Your answer", placeholder="Type your answer...")
+            answer_submitted = st.form_submit_button("Submit Answer", use_container_width=True)
+
+        if answer_submitted and answer_input:
+            result = api_post("/api/game/answer", {
+                "room_id": room_id, "user_id": USER_ID, "answer": answer_input,
+            })
+            if result and result.get("status") == "answered":
+                if result["result"] == "correct":
+                    st.success(f"Correct! +{result['reward']} ⚡ Catalyst Points!")
+                    st.balloons()
+                else:
+                    st.error(f"Wrong! The answer was: **{result['correct_answer']}**")
+                st.rerun()
+            elif result:
+                st.error(result.get("detail", "Error"))
+    else:
+        st.caption("No active game. Start a new trivia challenge!")
+        if st.button("🎲 Start Trivia", use_container_width=True):
+            result = api_post("/api/game/start", {
+                "user_id": USER_ID, "user_name": USER_NAME,
+            })
+            if result and result.get("status") == "started":
+                st.rerun()
+            else:
+                st.error("Could not start game.")
+
+
+# ===================== TAB 5: GOALS & TASKS =====================
 with tab_goals:
     st.markdown("### 🎯 Mission Control")
 
-    # New goal form
     with st.form("goal_form", clear_on_submit=True):
-        goal_title = st.text_input(
-            "New Goal",
-            placeholder="e.g., Write 3 journal entries this week",
-        )
+        g_col1, g_col2 = st.columns([3, 1])
+        with g_col1:
+            goal_title = st.text_input("New Goal", placeholder="e.g., Write 3 journal entries this week")
+        with g_col2:
+            target_date = st.date_input("Target date", value=None)
         goal_submitted = st.form_submit_button("Add Goal", use_container_width=True)
 
     if goal_submitted and goal_title:
         result = api_post("/api/goals", {
-            "user_id": USER_ID,
-            "user_name": USER_NAME,
-            "title": goal_title,
+            "user_id": USER_ID, "user_name": USER_NAME, "title": goal_title,
+            "target_date": target_date.isoformat() if target_date else "",
         })
         if result and result.get("status") == "success":
             st.success(f"Goal created! (ID: {result['goal_id']})")
             st.rerun()
         else:
             st.error("Failed to create goal.")
-    elif goal_submitted:
-        st.warning("Please enter a goal title.")
 
     st.divider()
 
-    # Existing goals
     goals_data = api_get(f"/api/goals/{USER_ID}")
     goals = goals_data.get("goals", []) if goals_data else []
 
@@ -319,15 +461,22 @@ with tab_goals:
             gid = goal["id"]
             status = goal["status"]
             title = goal["title"]
+            progress = goal.get("progress", 0)
+            tdate = goal.get("target_date", "")
 
-            col_title, col_action = st.columns([4, 1])
+            col_title, col_progress, col_action = st.columns([3, 1, 1])
             with col_title:
                 if status == "completed":
                     st.markdown(f'<span class="goal-done">✅ {title}</span>', unsafe_allow_html=True)
                 elif status == "abandoned":
                     st.markdown(f'<span class="goal-dropped">⏹️ {title}</span>', unsafe_allow_html=True)
                 else:
-                    st.markdown(f'<span class="goal-active">🔄 {title}</span>', unsafe_allow_html=True)
+                    deadline_label = f" (due {tdate})" if tdate else ""
+                    st.markdown(f'<span class="goal-active">🔄 {title}{deadline_label}</span>', unsafe_allow_html=True)
+
+            with col_progress:
+                if status == "in_progress":
+                    st.progress(progress / 100, text=f"{progress}%")
 
             with col_action:
                 if status == "in_progress":
@@ -337,26 +486,50 @@ with tab_goals:
 
     st.divider()
 
-    # Discipline Boss trigger
-    if st.button("📢 Summon Discipline Boss", use_container_width=True,
-                  help="Send a reminder SSE event for all pending goals"):
+    if st.button("📢 Summon Discipline Boss", use_container_width=True):
         result = api_post(f"/api/goals/{USER_ID}/remind")
         if result and result.get("status") == "reminder_sent":
-            st.success(
-                f"Discipline Boss alerted! {result['pending_count']} pending goal(s). "
-                "Refresh messages to see the response."
-            )
+            st.success(f"Discipline Boss alerted! {result['pending_count']} pending goal(s).")
         elif result and result.get("status") == "no_pending_goals":
-            st.info("No pending goals — nothing to remind!")
+            st.info("No pending goals!")
         else:
             st.error("Could not trigger reminder.")
 
 
-# ===================== TAB 4: WILDCATS EVENTS =====================
+# ===================== TAB 6: CATALYST POINTS =====================
+with tab_points:
+    st.markdown("### ⚡ Catalyst Points")
+
+    # Balance
+    token_data = api_get(f"/api/tokens/{USER_ID}")
+    bal = token_data["balance"] if token_data else 0
+    st.markdown(f'<div class="token-badge" style="font-size:1.5em;">⚡ {bal} Points</div>', unsafe_allow_html=True)
+
+    st.divider()
+    st.markdown("**Transaction History**")
+
+    txn_data = api_get(f"/api/tokens/{USER_ID}/transactions")
+    txns = txn_data.get("transactions", []) if txn_data else []
+
+    if not txns:
+        st.caption("No transactions yet. Earn points by completing trivia and goals!")
+    else:
+        for txn in txns:
+            amount = txn["amount"]
+            sign = "+" if amount > 0 else ""
+            color = "green" if amount > 0 else "red"
+            st.markdown(
+                f":{color}[**{sign}{amount}**] — {txn['reason']}  \n"
+                f"<small>{txn.get('created_at', '')}</small>",
+                unsafe_allow_html=True,
+            )
+
+
+# ===================== TAB 7: WILDCATS EVENTS =====================
 with tab_events:
     st.markdown("### 🗓️ Wildcats Community Events")
 
-    col_refresh, col_spacer2 = st.columns([1, 4])
+    col_refresh, col_spacer = st.columns([1, 4])
     with col_refresh:
         if st.button("🔄 Refresh Events"):
             api_post("/api/events/refresh")
@@ -375,25 +548,18 @@ with tab_events:
                     title = ev.get("title", "Untitled")
                     desc = ev.get("description", "")
                     url = ev.get("event_url", "")
-
                     if url:
                         st.markdown(f"**[{title}]({url})**")
                     else:
                         st.markdown(f"**{title}**")
-
                     if desc:
                         st.caption(desc[:200])
-
                     tags = ev.get("tags", [])
                     if tags:
                         st.markdown(" ".join(f"`{t}`" for t in tags))
-
                 with c2:
-                    date = ev.get("event_date", "")
-                    loc = ev.get("location", "")
-                    if date:
-                        st.markdown(f"📅 {date}")
-                    if loc:
-                        st.markdown(f"📍 {loc}")
-
+                    if ev.get("event_date"):
+                        st.markdown(f"📅 {ev['event_date']}")
+                    if ev.get("location"):
+                        st.markdown(f"📍 {ev['location']}")
                 st.divider()

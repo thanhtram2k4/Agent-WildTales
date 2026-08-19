@@ -1,6 +1,8 @@
 # mcp_tools.py — Knowledge ingestion: URL fetching, text extraction, chunking
+import ipaddress
 import re
 import logging
+import socket
 from urllib.parse import urlparse
 
 import requests
@@ -12,6 +14,63 @@ logger = logging.getLogger("wildtails.mcp_tools")
 FETCH_TIMEOUT = 15  # seconds
 MAX_CONTENT_BYTES = 2 * 1024 * 1024  # 2 MB
 MAX_TEXT_CHARS = 50_000  # truncate extracted text beyond this
+
+
+# --- SSRF-safe URL validation ---
+
+# Private / reserved IP ranges that must never be fetched
+_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
+
+def validate_url(url: str) -> str | None:
+    """Validate a URL for safe external fetching.
+
+    Returns the cleaned URL or None if the URL is invalid/blocked.
+    Rules:
+    - Only http/https schemes allowed
+    - Hostname must not resolve to a private/local IP (SSRF prevention)
+    - No empty or overly long URLs
+    """
+    if not url or len(url) > 4096:
+        return None
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+
+    # Only allow http/https
+    if parsed.scheme not in ("http", "https"):
+        return None
+
+    hostname = parsed.hostname
+    if not hostname:
+        return None
+
+    # Resolve hostname and check against blocked networks
+    try:
+        addr_infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        for family, _, _, _, sockaddr in addr_infos:
+            ip = ipaddress.ip_address(sockaddr[0])
+            for net in _BLOCKED_NETWORKS:
+                if ip in net:
+                    logger.warning("URL %s resolves to blocked IP %s", url, ip)
+                    return None
+    except socket.gaierror:
+        # Can't resolve hostname — allow it (will fail at fetch time)
+        pass
+
+    return url
 
 
 def _is_youtube_url(url: str) -> bool:
@@ -126,14 +185,20 @@ def fetch_and_extract(url: str) -> dict | None:
 
     Returns dict with keys: title, text, source_type
     or None on failure.
+    Applies SSRF-safe URL validation before any network request.
     """
-    if _is_youtube_url(url):
-        result = _fetch_youtube_transcript(url)
+    safe_url = validate_url(url)
+    if safe_url is None:
+        logger.warning("URL validation failed for: %s", url)
+        return None
+
+    if _is_youtube_url(safe_url):
+        result = _fetch_youtube_transcript(safe_url)
         if result is not None:
             return result
         # Fall through to article scrape for YouTube pages without transcript
 
-    return _fetch_article(url)
+    return _fetch_article(safe_url)
 
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
