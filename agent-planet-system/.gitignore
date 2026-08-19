@@ -1,0 +1,36 @@
+# Database
+*.db
+*.db-journal
+
+# ChromaDB local store
+chroma_db/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment secrets
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test cache
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db

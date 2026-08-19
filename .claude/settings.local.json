@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "Bash(pip install:*)"
+      "Bash(pip install:*)",
+      "Bash(grep -E \"\\\\.\\(py|txt|env|yml|yaml|json\\)$\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('app.py', doraise=True\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('ui.py', doraise=True\\); py_compile.compile\\('other_agents_client.py', doraise=True\\); print\\('All files OK'\\)\")",
+      "Bash(python -c ':*)",
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "Bash(python -m pytest tests/ -v)"
     ]
   }
 }
