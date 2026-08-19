@@ -7,7 +7,9 @@
       "Bash(python -c \"import py_compile; py_compile.compile\\('ui.py', doraise=True\\); py_compile.compile\\('other_agents_client.py', doraise=True\\); print\\('All files OK'\\)\")",
       "Bash(python -c ':*)",
       "Bash(python -m pytest tests/ -v --tb=short)",
-      "Bash(python -m pytest tests/ -v)"
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(python -c \" import ast with open\\('app.py', encoding='utf-8'\\) as f: tree = ast.parse\\(f.read\\(\\)\\) for node in ast.walk\\(tree\\): if isinstance\\(node, ast.AsyncFunctionDef\\): for dec in node.decorator_list: if isinstance\\(dec, ast.Call\\) and hasattr\\(dec.func, 'attr'\\): print\\(f' {dec.func.attr.upper\\(\\):6s} {node.name}'\\) \")",
+      "Bash(python -m pytest tests/ --collect-only -q)"
     ]
   }
 }
