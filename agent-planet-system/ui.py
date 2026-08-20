@@ -6,9 +6,23 @@ from ui.sse_component import render_sse_listener
 
 # --- Configuration ---
 API_URL = "http://127.0.0.1:8000"
-USER_ID = "u1"
-USER_NAME = "Mina"
 SSE_POLL_INTERVAL = 3  # seconds between message polls
+
+# Demo users for beta testing
+DEMO_USERS = {
+    "Mina": "u1",
+    "Alex": "u2",
+    "Luna": "u3",
+}
+
+# Initialize demo user in session state
+if "user_id" not in st.session_state:
+    st.session_state.user_id = "u1"
+if "user_name" not in st.session_state:
+    st.session_state.user_name = "Mina"
+
+USER_ID = st.session_state.user_id
+USER_NAME = st.session_state.user_name
 
 # Agent display config: sender_name -> (emoji, label)
 AGENT_STYLE = {
@@ -302,6 +316,25 @@ with st.sidebar:
     st.caption("Catalyst Verse — Multi-Agent Journal")
     st.divider()
 
+    # Demo identity selector
+    selected_name = st.selectbox(
+        "Switch Demo User",
+        list(DEMO_USERS.keys()),
+        index=list(DEMO_USERS.keys()).index(USER_NAME),
+        key="demo_user_selector",
+    )
+    if selected_name != st.session_state.user_name:
+        st.session_state.user_name = selected_name
+        st.session_state.user_id = DEMO_USERS[selected_name]
+        # Reset mood/planet state for new user
+        st.session_state.planet = ""
+        st.session_state.mood = ""
+        st.session_state.last_msg_count = 0
+        st.rerun()
+
+    USER_ID = st.session_state.user_id
+    USER_NAME = st.session_state.user_name
+
     st.image(
         f"https://api.dicebear.com/7.x/notionists/svg?seed={USER_NAME}&backgroundColor=b6e3f4",
         width=90,
@@ -406,7 +439,11 @@ with tab_cabin:
 
 # ===================== TAB 2: PLANET FEED (PUBLIC) =====================
 with tab_feed:
-    st.markdown("Public journal entries visible to the agent ecosystem.")
+    st.markdown(
+        "> **Welcome to the Planet Feed!** Public entries here can trigger Agents "
+        "that respond with insights, challenges, and rewards. "
+        "Private thoughts stay safe in the **Captain's Cabin** — agents never see them."
+    )
 
     messages = []
     msg_data = api_get("/api/messages", params={"scope": f"owner:{USER_ID}"})
