@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import random
 import time
 import threading
 from abc import ABC, abstractmethod
@@ -18,6 +19,10 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3")
 
+# Inter-agent collaboration limits
+MAX_AGENT_DEPTH = 2          # max consecutive agent-to-agent replies
+AGENT_REPLY_DELAY = (1.5, 4.0)  # random delay range (seconds) before replying to another agent
+
 
 class BaseAgent(ABC):
     """Abstract base class for all WildTails persona agents.
@@ -27,6 +32,11 @@ class BaseAgent(ABC):
       - system_prompt: LLM system prompt defining persona
       - event_filter(data): return True if this agent should handle the event
       - handle_event(data): process the event and optionally reply
+
+    For inter-agent collaboration, subclasses may override:
+      - agent_reply_filter(data): return True if this agent should react to
+        another agent's AGENT_REPLY event.  Defaults to False (opt-in).
+      - handle_agent_reply(data): process the other agent's message.
     """
 
     RECONNECT_DELAY = 3  # seconds between SSE reconnect attempts
@@ -56,6 +66,29 @@ class BaseAgent(ABC):
     @abstractmethod
     def handle_event(self, data: dict) -> None:
         """Process a filtered SSE event. May call generate_reply / send_reply."""
+
+    # --- Inter-agent collaboration (opt-in) ---
+
+    def agent_reply_filter(self, data: dict) -> bool:
+        """Return True if this agent should react to another agent's reply.
+
+        Override in subclasses that participate in inter-agent conversation.
+        The default returns False — agents ignore each other unless they
+        explicitly opt in.
+
+        Args:
+            data: The AGENT_REPLY event payload.  Contains at minimum:
+                  sender, content, user_id, conversation_id, depth.
+        """
+        return False
+
+    def handle_agent_reply(self, data: dict) -> None:
+        """React to another agent's AGENT_REPLY event.
+
+        Override in subclasses.  The ``depth`` field has already been
+        validated (< MAX_AGENT_DEPTH) before this method is called.
+        Call ``send_reply(..., depth=data["depth"] + 1)`` to chain.
+        """
 
     # --- Shared utilities ---
 
@@ -98,13 +131,16 @@ class BaseAgent(ABC):
             logger.warning("[%s] LLM generation failed: %s", self.agent_name, e)
             return ""
 
-    def send_reply(self, message: str, user_id: str = "", conversation_id: str = "") -> None:
+    def send_reply(self, message: str, user_id: str = "",
+                   conversation_id: str = "", depth: int = 0) -> None:
         """Post a reply back to the backend chat timeline.
 
         Args:
             message: The reply text.
             user_id: Target user this reply is for (from SSE event envelope).
             conversation_id: Conversation this reply belongs to.
+            depth: Inter-agent depth counter.  0 = direct reply to user,
+                   1 = reply to another agent's reply, etc.
         """
         if not message:
             return
@@ -116,10 +152,12 @@ class BaseAgent(ABC):
                     "message": message,
                     "user_id": user_id,
                     "conversation_id": conversation_id,
+                    "depth": depth,
                 },
                 timeout=5,
             )
-            logger.info("[%s] Reply sent (user=%s, conv=%s)", self.agent_name, user_id, conversation_id)
+            logger.info("[%s] Reply sent (user=%s, conv=%s, depth=%d)",
+                        self.agent_name, user_id, conversation_id, depth)
         except requests.exceptions.ConnectionError:
             logger.warning("[%s] Failed to send reply to backend", self.agent_name)
 
@@ -149,7 +187,12 @@ class BaseAgent(ABC):
                         except json.JSONDecodeError:
                             continue
 
-                        # Deterministic routing: only process if filter matches
+                        # --- Inter-agent collaboration routing ---
+                        if data.get("type") == "AGENT_REPLY":
+                            self._dispatch_agent_reply(data)
+                            continue
+
+                        # --- Standard event routing ---
                         if self.event_filter(data):
                             logger.info("[%s] Handling event: %s", self.agent_name, data.get("type"))
                             try:
@@ -163,6 +206,43 @@ class BaseAgent(ABC):
             except Exception as e:
                 logger.warning("[%s] Unexpected error: %s, retrying in %ds", self.agent_name, e, self.RECONNECT_DELAY)
                 time.sleep(self.RECONNECT_DELAY)
+
+    def _dispatch_agent_reply(self, data: dict) -> None:
+        """Route an AGENT_REPLY event through inter-agent safeguards.
+
+        Safeguards:
+        1. Self-ignore: never react to your own replies.
+        2. Depth limit: refuse if depth >= MAX_AGENT_DEPTH.
+        3. Opt-in gate: only dispatch if agent_reply_filter() returns True.
+        4. Thinking delay: random pause to simulate natural conversation pacing.
+        """
+        sender = data.get("sender", "")
+
+        # 1. Never respond to yourself
+        if sender == self.agent_name:
+            return
+
+        # 2. Enforce depth limit
+        depth = data.get("depth", 0)
+        if depth >= MAX_AGENT_DEPTH:
+            logger.debug("[%s] Ignoring AGENT_REPLY from %s (depth %d >= %d)",
+                         self.agent_name, sender, depth, MAX_AGENT_DEPTH)
+            return
+
+        # 3. Opt-in filter
+        if not self.agent_reply_filter(data):
+            return
+
+        # 4. Thinking delay — prevents instant agent flood
+        delay = random.uniform(*AGENT_REPLY_DELAY)
+        logger.info("[%s] Reacting to %s's reply (depth %d) after %.1fs delay",
+                    self.agent_name, sender, depth, delay)
+        time.sleep(delay)
+
+        try:
+            self.handle_agent_reply(data)
+        except Exception as e:
+            logger.error("[%s] Error handling agent reply: %s", self.agent_name, e)
 
     def stop(self) -> None:
         """Signal the listener to stop."""

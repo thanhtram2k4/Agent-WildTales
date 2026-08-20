@@ -1,6 +1,7 @@
 # app.py
 import asyncio
 import json
+import re
 import sqlite3
 import os
 import uuid
@@ -141,11 +142,22 @@ def init_db():
         for col_sql in [
             "ALTER TABLE game_rooms ADD COLUMN result TEXT DEFAULT NULL",
             "ALTER TABLE game_rooms ADD COLUMN finished_at DATETIME DEFAULT NULL",
+            # --- Ma Sói RPG state machine migration ---
+            "ALTER TABLE game_rooms ADD COLUMN phase TEXT NOT NULL DEFAULT 'WAITING'",
+            "ALTER TABLE game_rooms ADD COLUMN round_number INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE game_rooms ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE game_rooms ADD COLUMN game_state TEXT NOT NULL DEFAULT '{}'",
         ]:
             try:
                 conn.execute(col_sql)
             except sqlite3.OperationalError:
                 pass
+
+        # Backfill phase from status for legacy trivia rows
+        conn.execute("""
+            UPDATE game_rooms SET phase = status
+            WHERE phase = 'WAITING' AND status != 'WAITING' AND game_type = 'trivia'
+        """)
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS goals (
@@ -217,16 +229,37 @@ async def embed_text(text: str) -> list[float] | None:
         logger.warning("Embedding generation failed (non-fatal): %s", e)
         return None
 
-MOOD_SYSTEM_PROMPT = """Bạn là chuyên gia phân tích tâm lý. Nhiệm vụ của bạn là đọc nhật ký của người dùng (viết bằng tiếng Việt), phân tích trạng thái cảm xúc, và phân loại họ vào một trong hai hành tinh.
+MOOD_SYSTEM_PROMPT = """\
+You are a sentiment classifier. Read the user's Vietnamese journal entry and classify it.
 
-Quy tắc phân loại:
-- Nếu cảm xúc là tích cực, vui vẻ, năng động, hào hứng, hoặc muốn vui chơi → planet = "Hành tinh mặt trời", action = "stay"
-- Nếu cảm xúc là cô đơn, hoài niệm, buồn bã, nhớ nhung, hoặc cần kết nối → planet = "Vườn kỷ niệm", action = "connect_others"
+RULES:
+- Positive, happy, excited, energetic, playful → planet = "sun"
+- Lonely, nostalgic, sad, missing someone, needing connection → planet = "garden"
+- Neutral, informational, unclear → planet = "sun"
 
-Bạn PHẢI trả về DUY NHẤT một JSON object hợp lệ, KHÔNG có markdown, KHÔNG có giải thích, KHÔNG có text nào khác ngoài JSON.
+You MUST reply with ONLY this JSON and nothing else — no markdown, no explanation:
+{"mood": "<short Vietnamese mood description>", "planet": "<sun or garden>", "action": "<stay or connect_others>"}
 
-Format bắt buộc:
-{"mood": "<mô tả ngắn cảm xúc bằng tiếng Việt>", "planet": "<Hành tinh mặt trời hoặc Vườn kỷ niệm>", "action": "<stay hoặc connect_others>"}"""
+EXAMPLES:
+User: Hôm nay tôi rất vui vì được gặp bạn bè!
+{"mood": "Vui vẻ, hào hứng", "planet": "sun", "action": "stay"}
+
+User: Tôi nhớ mẹ quá, muốn về nhà...
+{"mood": "Nhớ nhung, cô đơn", "planet": "garden", "action": "connect_others"}
+
+User: Hôm nay tôi đi học bình thường.
+{"mood": "Bình thường", "planet": "sun", "action": "stay"}"""
+
+# Canonical planet names — the LLM returns short keys ("sun"/"garden"),
+# the normaliser maps them to the full Vietnamese strings used everywhere else.
+_PLANET_MAP = {
+    "sun":    "Hành tinh mặt trời",
+    "garden": "Vườn kỷ niệm",
+}
+_ACTION_MAP = {
+    "sun":    "stay",
+    "garden": "connect_others",
+}
 
 @app.get("/")
 async def home():
@@ -317,11 +350,72 @@ class GoalUpdate(BaseModel):
     progress: int = -1  # 0-100, -1 means don't update
 
 # 1. Phân tích cảm xúc & Đề xuất Planet (LLM-powered via Ollama)
+
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+_JSON_OBJECT_RE = re.compile(r"\{[^{}]*\}")
+
+
+def _extract_json(raw: str) -> dict | None:
+    """Best-effort JSON extraction from LLM output.
+
+    Handles three common failure modes:
+    1. Clean JSON  → parse directly
+    2. Markdown-fenced JSON (```json ... ```)  → strip fences first
+    3. JSON buried in conversational text  → regex extract first { ... }
+    """
+    text = raw.strip()
+
+    # 1. Try direct parse
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # 2. Try stripping markdown code fences
+    m = _JSON_FENCE_RE.search(text)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # 3. Try extracting first JSON object from freeform text
+    m = _JSON_OBJECT_RE.search(text)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    return None
+
+
+def _normalise_planet(raw_planet: str) -> str | None:
+    """Map any reasonable LLM planet output to a canonical Vietnamese name.
+
+    Accepts: "sun", "garden", or the full Vietnamese strings with any
+    casing/whitespace.  Returns the canonical name or None on failure.
+    """
+    p = raw_planet.strip().lower()
+
+    # Short keys (preferred — the new prompt uses these)
+    if p in _PLANET_MAP:
+        return _PLANET_MAP[p]
+
+    # Full Vietnamese names (legacy / fallback)
+    if "mặt trời" in p or "mat troi" in p:
+        return _PLANET_MAP["sun"]
+    if "kỷ niệm" in p or "ky niem" in p or "garden" in p:
+        return _PLANET_MAP["garden"]
+
+    return None
+
+
 async def mood_and_planet_recommender(text: str) -> dict:
     fallback = {
-        "mood": "Trầm lắng / Cần kết nối",
-        "planet": "Vườn kỷ niệm",
-        "action": "connect_others",
+        "mood": "Bình thường",
+        "planet": "Hành tinh mặt trời",
+        "action": "stay",
     }
     try:
         response = await ollama_client.chat.completions.create(
@@ -333,22 +427,39 @@ async def mood_and_planet_recommender(text: str) -> dict:
             temperature=0.3,
         )
         raw = response.choices[0].message.content.strip()
-        result = json.loads(raw)
+        logger.info("[MoodRouter] LLM raw output: %s", raw)
 
-        # Validate required keys and allowed values
-        if result.get("planet") not in ("Hành tinh mặt trời", "Vườn kỷ niệm"):
-            return fallback
-        if result.get("action") not in ("stay", "connect_others"):
-            return fallback
-        if not result.get("mood"):
+        result = _extract_json(raw)
+        if result is None:
+            logger.warning("[MoodRouter] JSON extraction failed for: %s", raw)
             return fallback
 
-        return {
-            "mood": result["mood"],
-            "planet": result["planet"],
-            "action": result["action"],
-        }
-    except Exception:
+        # Normalise planet with fuzzy matching
+        raw_planet = result.get("planet", "")
+        planet = _normalise_planet(str(raw_planet))
+        if planet is None:
+            logger.warning("[MoodRouter] Unknown planet value: %r", raw_planet)
+            return fallback
+
+        # Normalise action
+        raw_action = str(result.get("action", "")).strip().lower()
+        if raw_action not in ("stay", "connect_others"):
+            # Infer action from planet
+            raw_action = _ACTION_MAP.get(
+                "sun" if planet == _PLANET_MAP["sun"] else "garden",
+                "stay",
+            )
+
+        mood = str(result.get("mood", "")).strip()
+        if not mood:
+            mood = fallback["mood"]
+
+        final = {"mood": mood, "planet": planet, "action": raw_action}
+        logger.info("[MoodRouter] Resolved: %s", final)
+        return final
+
+    except Exception as e:
+        logger.warning("[MoodRouter] Exception during mood analysis: %s", e)
         return fallback
 
 # 2. API nhận chat từ User
@@ -428,6 +539,20 @@ async def chat_interaction(payload: UserMessage):
             "message": f"Agent của {payload.user_name} vừa tham gia {analysis['planet']}.",
         }
         await event_bridge.broadcast(event_payload)
+
+        # Real-time SSE: broadcast NEW_MESSAGE so the UI component can
+        # inject the user's entry without a full Streamlit rerun.
+        new_msg_event = {
+            "event_id": str(uuid.uuid4()),
+            "type": "NEW_MESSAGE",
+            "user_id": payload.user_id,
+            "conversation_id": conversation_id,
+            "sender": payload.user_name,
+            "content": payload.message,
+            "visibility": "public",
+        }
+        await event_bridge.broadcast(new_msg_event)
+
         # Legacy subscriber support (tests)
         for queue in subscribers:
             await queue.put(json.dumps(event_payload))
@@ -458,6 +583,7 @@ class ExternalAgentReply(BaseModel):
     message: str
     user_id: str = ""
     conversation_id: str = ""
+    depth: int = 0  # inter-agent reply depth (0 = direct reply to user)
 
 @app.post("/api/external_agent_reply")
 async def receive_external_agent_reply(payload: ExternalAgentReply):
@@ -466,6 +592,23 @@ async def receive_external_agent_reply(payload: ExternalAgentReply):
             "INSERT INTO messages (sender_name, user_id, role, content, visibility, conversation_id) VALUES (?, ?, ?, ?, ?, ?)",
             (payload.agent_name, payload.user_id, "assistant", payload.message, "public", payload.conversation_id),
         )
+
+    # Real-time SSE: broadcast AGENT_REPLY so the UI component can
+    # inject the agent's response without a full Streamlit rerun.
+    # The depth field enables inter-agent collaboration while preventing
+    # infinite loops — agents refuse to reply when depth >= MAX_AGENT_DEPTH.
+    agent_reply_event = {
+        "event_id": str(uuid.uuid4()),
+        "type": "AGENT_REPLY",
+        "user_id": payload.user_id,
+        "conversation_id": payload.conversation_id,
+        "sender": payload.agent_name,
+        "content": payload.message,
+        "visibility": "public",
+        "depth": payload.depth,
+    }
+    await event_bridge.broadcast(agent_reply_event)
+
     return {"status": "success"}
 
 # 5. API trả về toàn bộ lịch sử hội thoại
@@ -951,24 +1094,256 @@ async def answer_game(payload: GameAnswerRequest):
 
 @app.get("/api/game/{user_id}/active")
 async def get_active_game(user_id: str):
-    """Get the user's currently active (IN_PROGRESS) game room, if any."""
+    """Get the user's currently active game room (trivia or RPG)."""
     with get_db() as conn:
         row = conn.execute(
-            "SELECT id, question_index, reward, status FROM game_rooms "
-            "WHERE user_id = ? AND status = 'IN_PROGRESS' ORDER BY id DESC LIMIT 1",
+            "SELECT id, game_type, question_index, reward, status, phase, round_number, game_state "
+            "FROM game_rooms "
+            "WHERE user_id = ? AND status != 'FINISHED' ORDER BY id DESC LIMIT 1",
             (user_id,),
         ).fetchone()
 
     if not row:
         return {"active": False}
 
+    if row["game_type"] == "masoi":
+        game_state = json.loads(row["game_state"]) if row["game_state"] else {}
+        alive_npcs = [n for n in game_state.get("alive_npcs", []) if n.get("alive", True)]
+        return {
+            "active": True,
+            "room_id": row["id"],
+            "game_type": "masoi",
+            "phase": row["phase"],
+            "round_number": row["round_number"],
+            "player_role": game_state.get("player_role", ""),
+            "alive_npcs": [n["name"] for n in alive_npcs],
+            "reward": row["reward"],
+        }
+
+    # Trivia (original)
     trivia = TRIVIA_POOL[row["question_index"]] if row["question_index"] < len(TRIVIA_POOL) else None
     return {
         "active": True,
         "room_id": row["id"],
+        "game_type": "trivia",
         "question": trivia["question"] if trivia else "Unknown question",
         "reward": row["reward"],
     }
+
+
+# ---------------------------------------------------------------------------
+# 7c. Ma Sói RPG API — multi-turn narrative Werewolf game
+# ---------------------------------------------------------------------------
+class RPGStartRequest(BaseModel):
+    user_id: str
+    user_name: str
+
+
+class RPGActionRequest(BaseModel):
+    room_id: int
+    user_id: str
+    target: str  # NPC name or action target
+
+
+class RPGAdvanceRequest(BaseModel):
+    phase: str
+    narrative: str = ""
+    game_state: dict | None = None
+
+
+@app.post("/api/game/rpg/start")
+async def start_rpg_game(payload: RPGStartRequest):
+    """Create a new Ma Sói RPG room with role assignment.
+
+    State machine: ROLE_ASSIGNMENT → NIGHT_PHASE → DAY_DISCUSSION → VOTING → (loop or FINISHED)
+    """
+    import random
+
+    # Build cast: 1 player + 5 NPCs from DEFAULT_CAST
+    from agents.gamemaster import DEFAULT_CAST, NPC_NAMES, MASOI_ROLES
+
+    roles = list(DEFAULT_CAST)
+    random.shuffle(roles)
+
+    player_role = roles[0]
+    npc_roles = roles[1:]
+
+    # Pick unique NPC names
+    npc_names = random.sample(NPC_NAMES, len(npc_roles))
+    alive_npcs = [
+        {"name": name, "role": role, "alive": True}
+        for name, role in zip(npc_names, npc_roles)
+    ]
+
+    game_state = {
+        "player_role": player_role,
+        "alive_npcs": alive_npcs,
+        "narrative_log": [],
+        "night_target": "",
+        "vote_target": "",
+        "last_victim": None,
+        "last_protected": False,
+        "seer_reveal": None,
+        "vote_eliminated": None,
+        "winner": None,
+    }
+
+    conversation_id = str(uuid.uuid4())
+
+    with get_db() as conn:
+        cursor = conn.execute(
+            "INSERT INTO game_rooms "
+            "(user_id, user_name, game_type, question_index, correct_answer, reward, status, phase, round_number, conversation_id, game_state) "
+            "VALUES (?, ?, 'masoi', 0, '', 15, 'IN_PROGRESS', 'ROLE_ASSIGNMENT', 1, ?, ?)",
+            (payload.user_id, payload.user_name, conversation_id, json.dumps(game_state)),
+        )
+        room_id = cursor.lastrowid
+
+    # Broadcast RPG event so the Gamemaster agent narrates the intro
+    rpg_event = {
+        "event_id": str(uuid.uuid4()),
+        "type": "GAME_REQUEST",
+        "game_type": "masoi",
+        "room_id": room_id,
+        "user_id": payload.user_id,
+        "user": payload.user_name,
+        "conversation_id": conversation_id,
+    }
+    await event_bridge.broadcast(rpg_event)
+
+    role_info = MASOI_ROLES.get(player_role, MASOI_ROLES["dân"])
+    return {
+        "status": "started",
+        "room_id": room_id,
+        "game_type": "masoi",
+        "player_role": player_role,
+        "role_emoji": role_info["emoji"],
+        "role_label": role_info["label"],
+        "role_desc": role_info["desc"],
+        "npc_names": [n["name"] for n in alive_npcs],
+        "conversation_id": conversation_id,
+    }
+
+
+@app.get("/api/game/rpg/{room_id}")
+async def get_rpg_room(room_id: int):
+    """Get full RPG room state (used by the Gamemaster agent)."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, user_id, user_name, game_type, status, phase, round_number, "
+            "conversation_id, game_state, reward, created_at, finished_at "
+            "FROM game_rooms WHERE id = ? AND game_type = 'masoi'",
+            (room_id,),
+        ).fetchone()
+
+    if not row:
+        return {"error": "Room not found"}
+
+    return {
+        "room_id": row["id"],
+        "user_id": row["user_id"],
+        "user_name": row["user_name"],
+        "status": row["status"],
+        "phase": row["phase"],
+        "round_number": row["round_number"],
+        "conversation_id": row["conversation_id"],
+        "game_state": row["game_state"],
+        "reward": row["reward"],
+    }
+
+
+@app.post("/api/game/rpg/{room_id}/advance")
+async def advance_rpg_phase(room_id: int, payload: RPGAdvanceRequest):
+    """Advance the RPG room to a new phase (called by the Gamemaster agent).
+
+    Valid phase transitions:
+        ROLE_ASSIGNMENT → NIGHT_PHASE
+        NIGHT_PHASE     → DAY_DISCUSSION
+        DAY_DISCUSSION  → VOTING
+        VOTING          → NIGHT_PHASE (next round)
+        any             → FINISHED
+    """
+    VALID_PHASES = ("ROLE_ASSIGNMENT", "NIGHT_PHASE", "DAY_DISCUSSION", "VOTING", "FINISHED")
+    if payload.phase not in VALID_PHASES:
+        return {"error": f"Invalid phase: {payload.phase}"}
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT phase, round_number, game_state FROM game_rooms WHERE id = ? AND game_type = 'masoi'",
+            (room_id,),
+        ).fetchone()
+        if not row:
+            return {"error": "Room not found"}
+
+        current_phase = row["phase"]
+        round_number = row["round_number"]
+
+        # Increment round when cycling back to NIGHT_PHASE from VOTING
+        if payload.phase == "NIGHT_PHASE" and current_phase == "VOTING":
+            round_number += 1
+
+        new_state = json.dumps(payload.game_state) if payload.game_state is not None else row["game_state"]
+        new_status = "FINISHED" if payload.phase == "FINISHED" else "IN_PROGRESS"
+
+        conn.execute(
+            "UPDATE game_rooms SET phase = ?, round_number = ?, game_state = ?, status = ?, "
+            "finished_at = CASE WHEN ? = 'FINISHED' THEN CURRENT_TIMESTAMP ELSE finished_at END "
+            "WHERE id = ?",
+            (payload.phase, round_number, new_state, new_status, payload.phase, room_id),
+        )
+
+    return {"status": "advanced", "phase": payload.phase, "round_number": round_number}
+
+
+@app.post("/api/game/rpg/{room_id}/action")
+async def rpg_player_action(room_id: int, payload: RPGActionRequest):
+    """Submit a player's night action or vote.
+
+    The backend stores the target and broadcasts an RPG_ACTION event
+    so the Gamemaster agent can resolve it and narrate the outcome.
+    """
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT user_id, phase, game_state FROM game_rooms WHERE id = ? AND game_type = 'masoi' AND status = 'IN_PROGRESS'",
+            (room_id,),
+        ).fetchone()
+
+    if not row:
+        return {"error": "Room not found or game finished"}
+    if row["user_id"] != payload.user_id:
+        return {"error": "Not your game room"}
+
+    phase = row["phase"]
+    game_state = json.loads(row["game_state"]) if row["game_state"] else {}
+
+    if phase == "NIGHT_PHASE":
+        action_type = "night_action"
+        game_state["night_target"] = payload.target
+    elif phase == "VOTING":
+        action_type = "vote"
+        game_state["vote_target"] = payload.target
+    else:
+        return {"error": f"No action allowed in phase: {phase}"}
+
+    # Persist the action
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE game_rooms SET game_state = ? WHERE id = ?",
+            (json.dumps(game_state), room_id),
+        )
+
+    # Broadcast RPG_ACTION for the Gamemaster agent to resolve
+    rpg_action_event = {
+        "event_id": str(uuid.uuid4()),
+        "type": "RPG_ACTION",
+        "room_id": room_id,
+        "user_id": payload.user_id,
+        "action": action_type,
+        "target": payload.target,
+    }
+    await event_bridge.broadcast(rpg_action_event)
+
+    return {"status": "action_received", "action": action_type, "target": payload.target}
 
 
 # 8. Token / Catalyst Points API (Phase G - Gamification)

@@ -2,6 +2,8 @@
 import streamlit as st
 import requests
 
+from ui.sse_component import render_sse_listener
+
 # --- Configuration ---
 API_URL = "http://127.0.0.1:8000"
 USER_ID = "u1"
@@ -23,64 +25,213 @@ st.set_page_config(
     layout="wide",
 )
 
-# --- WildTails Visual Identity: Navy / Teal / Golden Yellow ---
-st.markdown("""
-<style>
-    /* Cosmic dark sidebar — navy base */
-    [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #0b1628 0%, #132240 60%, #1a2d50 100%);
-    }
-    [data-testid="stSidebar"] * { color: #c9d1d9 !important; }
-    [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2,
-    [data-testid="stSidebar"] h3 { color: #4dd0c8 !important; }  /* teal headings */
+# --- Session State ---
+for key, default in [("planet", ""), ("mood", ""), ("last_msg_count", 0), ("auto_refresh", True)]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-    /* Token badge — golden yellow gradient */
-    .token-badge {
-        background: linear-gradient(135deg, #f5c842, #e6a817);
-        color: #0b1628 !important;
+
+# ---------------------------------------------------------------------------
+# Dynamic mood-based theming
+# ---------------------------------------------------------------------------
+def resolve_mood_theme(planet: str) -> str:
+    """Map the assigned planet string to a theme key.
+
+    Returns:
+        "sun"     — Positive mood  → Golden Yellow palette
+        "garden"  — Negative mood  → Deep Navy / Calming Blue palette
+        "neutral" — No mood yet    → Default Navy / Teal palette
+    """
+    p = planet.lower()
+    if "mặt trời" in p:
+        return "sun"
+    if "kỷ niệm" in p:
+        return "garden"
+    return "neutral"
+
+
+# Three complete CSS variable palettes.  Every colour in the UI reads from
+# these variables so changing them is a single-point switch.
+_THEME_VARS = {
+    # ── Default Hub (Neutral) — Navy / Teal ──
+    "neutral": {
+        "sidebar-bg":        "linear-gradient(180deg, #0b1628 0%, #132240 60%, #1a2d50 100%)",
+        "sidebar-text":      "#c9d1d9",
+        "sidebar-heading":   "#4dd0c8",
+        "accent":            "#4dd0c8",
+        "accent-glow":       "rgba(77, 208, 200, 0.25)",
+        "main-bg":           "transparent",
+        "heading-color":     "#4dd0c8",
+        "chat-user-bg":      "rgba(77, 208, 200, 0.08)",
+        "chat-user-border":  "#4dd0c8",
+        "chat-agent-bg":     "rgba(245, 200, 66, 0.06)",
+        "chat-agent-border": "#f5c842",
+        "badge-bg":          "linear-gradient(135deg, #f5c842, #e6a817)",
+        "badge-text":        "#0b1628",
+        "mood-banner-bg":    "linear-gradient(135deg, #132240, #1a2d50)",
+        "mood-banner-border": "#4dd0c8",
+        "mood-banner-text":  "#4dd0c8",
+        "mood-icon":         "🪐",
+        "mood-label":        "Neutral Hub",
+    },
+    # ── Sun Planet (Positive) — Golden Yellow / Warm Amber ──
+    "sun": {
+        "sidebar-bg":        "linear-gradient(180deg, #1a1505 0%, #2d2008 60%, #3d2e0a 100%)",
+        "sidebar-text":      "#e8d5a3",
+        "sidebar-heading":   "#f5c842",
+        "accent":            "#f5c842",
+        "accent-glow":       "rgba(245, 200, 66, 0.30)",
+        "main-bg":           "transparent",
+        "heading-color":     "#f5c842",
+        "chat-user-bg":      "rgba(245, 200, 66, 0.10)",
+        "chat-user-border":  "#f5c842",
+        "chat-agent-bg":     "rgba(245, 170, 40, 0.08)",
+        "chat-agent-border": "#e6a817",
+        "badge-bg":          "linear-gradient(135deg, #f5c842, #e6a817)",
+        "badge-text":        "#1a1505",
+        "mood-banner-bg":    "linear-gradient(135deg, #3d2e0a, #5a4510)",
+        "mood-banner-border": "#f5c842",
+        "mood-banner-text":  "#f5c842",
+        "mood-icon":         "☀️",
+        "mood-label":        "Sun Planet",
+    },
+    # ── Memory Garden (Negative) — Deep Navy / Calming Blue ──
+    "garden": {
+        "sidebar-bg":        "linear-gradient(180deg, #0a0e1a 0%, #0f1a30 60%, #162040 100%)",
+        "sidebar-text":      "#a0b4cc",
+        "sidebar-heading":   "#6c8ebf",
+        "accent":            "#6c8ebf",
+        "accent-glow":       "rgba(108, 142, 191, 0.25)",
+        "main-bg":           "transparent",
+        "heading-color":     "#6c8ebf",
+        "chat-user-bg":      "rgba(108, 142, 191, 0.10)",
+        "chat-user-border":  "#6c8ebf",
+        "chat-agent-bg":     "rgba(77, 208, 200, 0.06)",
+        "chat-agent-border": "#4dd0c8",
+        "badge-bg":          "linear-gradient(135deg, #6c8ebf, #4a6d9e)",
+        "badge-text":        "#0a0e1a",
+        "mood-banner-bg":    "linear-gradient(135deg, #0f1a30, #162040)",
+        "mood-banner-border": "#6c8ebf",
+        "mood-banner-text":  "#8fa8c8",
+        "mood-icon":         "🌿",
+        "mood-label":        "Memory Garden",
+    },
+}
+
+
+def _build_theme_css(theme_key: str) -> str:
+    """Build the full CSS string for the given theme, using CSS custom properties."""
+    t = _THEME_VARS.get(theme_key, _THEME_VARS["neutral"])
+    return f"""
+<style>
+    /* ====== CSS custom properties — single source of truth ====== */
+    :root {{
+        --wt-accent:            {t["accent"]};
+        --wt-accent-glow:       {t["accent-glow"]};
+        --wt-heading:           {t["heading-color"]};
+        --wt-chat-user-bg:      {t["chat-user-bg"]};
+        --wt-chat-user-border:  {t["chat-user-border"]};
+        --wt-chat-agent-bg:     {t["chat-agent-bg"]};
+        --wt-chat-agent-border: {t["chat-agent-border"]};
+    }}
+
+    /* ====== Sidebar ====== */
+    [data-testid="stSidebar"] {{
+        background: {t["sidebar-bg"]};
+        transition: background 0.6s ease;
+    }}
+    [data-testid="stSidebar"] * {{ color: {t["sidebar-text"]} !important; }}
+    [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3 {{ color: {t["sidebar-heading"]} !important; }}
+
+    /* ====== Main area ====== */
+    .stApp > header + div {{
+        transition: background 0.6s ease;
+    }}
+
+    /* ====== Token badge ====== */
+    .token-badge {{
+        background: {t["badge-bg"]};
+        color: {t["badge-text"]} !important;
         padding: 8px 16px;
         border-radius: 20px;
         font-weight: 700;
         font-size: 1.1em;
         text-align: center;
         margin: 8px 0;
-    }
-    /* Planet indicators */
-    .planet-indicator {
+        transition: background 0.5s ease;
+    }}
+
+    /* ====== Mood banner (sidebar) ====== */
+    .mood-banner {{
+        background: {t["mood-banner-bg"]};
+        color: {t["mood-banner-text"]} !important;
+        padding: 10px 14px;
+        border-radius: 10px;
+        border-left: 4px solid {t["mood-banner-border"]};
+        margin: 8px 0;
+        font-size: 0.9em;
+        line-height: 1.4;
+        transition: background 0.5s ease, border-color 0.5s ease;
+    }}
+    .mood-banner strong {{
+        color: {t["mood-banner-text"]} !important;
+    }}
+
+    /* ====== Planet indicators ====== */
+    .planet-indicator {{
         padding: 6px 12px; border-radius: 12px;
         font-weight: 600; text-align: center; margin: 4px 0;
-    }
-    .planet-sun {
+    }}
+    .planet-sun {{
         background: linear-gradient(135deg, #f5c842, #e6a817);
         color: #0b1628 !important;
-    }
-    .planet-garden {
-        background: linear-gradient(135deg, #4dd0c8, #2da89e);
-        color: #0b1628 !important;
-    }
-    /* Goal status pills */
-    .goal-active { color: #4dd0c8; font-weight: 600; }
-    .goal-done { color: #3fb950; font-weight: 600; }
-    .goal-dropped { color: #8b949e; text-decoration: line-through; }
-    /* Private banner */
-    .private-banner {
+    }}
+    .planet-garden {{
+        background: linear-gradient(135deg, #6c8ebf, #4a6d9e);
+        color: #0a0e1a !important;
+    }}
+
+    /* ====== Chat message accents ====== */
+    [data-testid="stChatMessage"] {{
+        transition: border-color 0.4s ease;
+    }}
+
+    /* ====== Goal status pills ====== */
+    .goal-active {{ color: var(--wt-accent); font-weight: 600; }}
+    .goal-done {{ color: #3fb950; font-weight: 600; }}
+    .goal-dropped {{ color: #8b949e; text-decoration: line-through; }}
+
+    /* ====== Private banner (Captain's Cabin — never changes) ====== */
+    .private-banner {{
         background: linear-gradient(135deg, #2d1b4e, #1a1040);
         color: #d4a5ff !important;
         padding: 10px 16px; border-radius: 8px;
         border-left: 4px solid #9b59b6;
         margin-bottom: 12px;
-    }
-    /* Health status */
-    .health-ok { color: #3fb950; }
-    .health-warn { color: #f5c842; }
-    .health-err { color: #f85149; }
-</style>
-""", unsafe_allow_html=True)
+    }}
 
-# --- Session State ---
-for key, default in [("planet", ""), ("mood", ""), ("last_msg_count", 0), ("auto_refresh", True)]:
-    if key not in st.session_state:
-        st.session_state[key] = default
+    /* ====== Health status ====== */
+    .health-ok {{ color: #3fb950; }}
+    .health-warn {{ color: #f5c842; }}
+    .health-err {{ color: #f85149; }}
+
+    /* ====== Ambient glow — subtle planet-coloured shadow under header ====== */
+    .planet-glow {{
+        height: 3px;
+        background: var(--wt-accent);
+        box-shadow: 0 0 18px 4px var(--wt-accent-glow);
+        border-radius: 2px;
+        margin: -4px 0 12px 0;
+        transition: background 0.6s ease, box-shadow 0.6s ease;
+    }}
+</style>
+"""
+
+
+# Resolve theme and inject CSS
+_current_theme = resolve_mood_theme(st.session_state.planet)
+st.markdown(_build_theme_css(_current_theme), unsafe_allow_html=True)
 
 
 # --- Helpers ---
@@ -115,11 +266,12 @@ def api_put(path, json_data=None, timeout=10):
 
 
 def get_planet_html(planet: str) -> str:
-    if "mặt trời" in planet.lower():
+    p = planet.lower()
+    if "mặt trời" in p:
         return f'<div class="planet-indicator planet-sun">☀️ {planet}</div>'
-    elif "kỷ niệm" in planet.lower():
+    if "kỷ niệm" in p:
         return f'<div class="planet-indicator planet-garden">🌿 {planet}</div>'
-    return f'<div class="planet-indicator">🪐 {planet}</div>'
+    return f'<div class="planet-indicator" style="background:var(--wt-accent);color:#0b1628;">🪐 {planet}</div>'
 
 
 def render_chat_messages(messages, show_private=True):
@@ -163,15 +315,19 @@ with st.sidebar:
 
     st.divider()
 
-    # Status
-    if st.session_state.mood:
-        st.markdown(f"**Mood:** {st.session_state.mood}")
-    else:
-        st.caption("Mood: awaiting journal entry")
-
-    if st.session_state.planet:
+    # Mood-aware status banner
+    _theme_meta = _THEME_VARS.get(_current_theme, _THEME_VARS["neutral"])
+    if st.session_state.mood and st.session_state.planet:
+        st.markdown(
+            f'<div class="mood-banner">'
+            f'{_theme_meta["mood-icon"]} <strong>{_theme_meta["mood-label"]}</strong><br>'
+            f'{st.session_state.mood}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
         st.markdown(get_planet_html(st.session_state.planet), unsafe_allow_html=True)
     else:
+        st.caption("Mood: awaiting journal entry")
         st.caption("Planet: not assigned yet")
 
     st.divider()
@@ -196,6 +352,7 @@ with st.sidebar:
 
 # ==================== MAIN CONTENT ====================
 st.markdown("# 🪐 WildTails — Catalyst Verse")
+st.markdown('<div class="planet-glow"></div>', unsafe_allow_html=True)
 
 tab_cabin, tab_feed, tab_knowledge, tab_lounge, tab_goals, tab_points, tab_events = st.tabs([
     "🔒 Captain's Cabin",
@@ -288,18 +445,17 @@ with tab_feed:
             else:
                 placeholder.error("Cannot connect to Backend. Make sure `python app.py` is running.")
 
-    # Auto-refresh
+    # Real-time SSE listener — replaces st.fragment polling.
+    # Injects NEW_MESSAGE and AGENT_REPLY events directly into the DOM
+    # without triggering a Streamlit rerun. Only public messages are
+    # broadcast by the backend, so Captain's Cabin stays isolated.
     if st.session_state.auto_refresh:
-        @st.fragment(run_every=SSE_POLL_INTERVAL)
-        def _poll_for_updates():
-            data = api_get("/api/messages", params={"scope": f"owner:{USER_ID}"})
-            if data:
-                pub_msgs = [m for m in data.get("messages", []) if m.get("visibility") == "public"]
-                if len(pub_msgs) > st.session_state.last_msg_count:
-                    st.session_state.last_msg_count = len(pub_msgs)
-                    st.rerun()
-
-        _poll_for_updates()
+        render_sse_listener(
+            sse_url=f"{API_URL}/api/sse/events",
+            user_id=USER_ID,
+            height=0,
+            theme=_current_theme,
+        )
 
 
 # ===================== TAB 3: KNOWLEDGE STATION =====================
@@ -382,48 +538,140 @@ with tab_knowledge:
             st.info("Could not generate an answer.")
 
 
-# ===================== TAB 4: MEETING LOUNGE (TRIVIA) =====================
+# ===================== TAB 4: MEETING LOUNGE (TRIVIA + MA SÓI RPG) =====================
 with tab_lounge:
-    st.markdown("### 🎮 Meeting Lounge — Trivia Challenge")
+    st.markdown("### 🎮 Meeting Lounge")
 
-    # Check for active game
+    # Check for any active game
     active_game = api_get(f"/api/game/{USER_ID}/active")
 
     if active_game and active_game.get("active"):
+        game_type = active_game.get("game_type", "trivia")
         room_id = active_game["room_id"]
-        question = active_game["question"]
-        reward = active_game["reward"]
 
-        st.info(f"**Active Game (Room #{room_id})** — {reward} ⚡ at stake!")
-        st.markdown(f"**Question:** {question}")
+        if game_type == "masoi":
+            # ---- Ma Sói RPG UI ----
+            phase = active_game.get("phase", "NIGHT_PHASE")
+            round_num = active_game.get("round_number", 1)
+            player_role = active_game.get("player_role", "")
+            alive_npcs = active_game.get("alive_npcs", [])
 
-        with st.form("answer_form", clear_on_submit=True):
-            answer_input = st.text_input("Your answer", placeholder="Type your answer...")
-            answer_submitted = st.form_submit_button("Submit Answer", use_container_width=True)
+            # Role display
+            ROLE_EMOJI = {"sói": "🐺", "tiên_tri": "🔮", "bảo_vệ": "🛡️", "dân": "🐱", "thợ_săn": "🏹"}
+            role_em = ROLE_EMOJI.get(player_role, "🐱")
+            st.info(f"**Ma Sói RPG (Room #{room_id})** — Vòng {round_num} | {role_em} Vai: {player_role}")
 
-        if answer_submitted and answer_input:
-            result = api_post("/api/game/answer", {
-                "room_id": room_id, "user_id": USER_ID, "answer": answer_input,
-            })
-            if result and result.get("status") == "answered":
-                if result["result"] == "correct":
-                    st.success(f"Correct! +{result['reward']} ⚡ Catalyst Points!")
-                    st.balloons()
-                else:
-                    st.error(f"Wrong! The answer was: **{result['correct_answer']}**")
-                st.rerun()
-            elif result:
-                st.error(result.get("detail", "Error"))
+            # Phase indicator
+            phase_labels = {
+                "ROLE_ASSIGNMENT": "📜 Phân vai...",
+                "NIGHT_PHASE": "🌙 Đêm — chọn hành động",
+                "DAY_DISCUSSION": "☀️ Ban ngày — thảo luận",
+                "VOTING": "⚖️ Bỏ phiếu loại người chơi",
+                "FINISHED": "🏁 Trò chơi kết thúc",
+            }
+            st.markdown(f"**Giai đoạn:** {phase_labels.get(phase, phase)}")
+            st.caption(f"Còn sống: {', '.join(alive_npcs)}")
+
+            # Night action or Vote input
+            if phase == "NIGHT_PHASE" and player_role in ("sói", "tiên_tri", "bảo_vệ"):
+                action_labels = {"sói": "Tấn công", "tiên_tri": "Soi", "bảo_vệ": "Bảo vệ"}
+                targets = list(alive_npcs)
+                if player_role == "bảo_vệ":
+                    targets = [USER_NAME] + targets
+
+                with st.form("night_action_form", clear_on_submit=True):
+                    target = st.selectbox(
+                        f"{action_labels[player_role]} ai?", targets,
+                    )
+                    submitted = st.form_submit_button(
+                        f"{role_em} {action_labels[player_role]}", use_container_width=True,
+                    )
+                if submitted and target:
+                    result = api_post(f"/api/game/rpg/{room_id}/action", {
+                        "room_id": room_id, "user_id": USER_ID, "target": target,
+                    })
+                    if result and result.get("status") == "action_received":
+                        st.success(f"Hành động đã gửi: {target}")
+                        st.rerun()
+                    elif result:
+                        st.error(result.get("error", "Error"))
+
+            elif phase == "NIGHT_PHASE":
+                st.caption("Bạn là Dân Làng — đang ngủ... chờ bình minh.")
+
+            elif phase == "VOTING":
+                with st.form("vote_form", clear_on_submit=True):
+                    target = st.selectbox("Bỏ phiếu loại ai?", alive_npcs)
+                    submitted = st.form_submit_button("⚖️ Bỏ phiếu", use_container_width=True)
+                if submitted and target:
+                    result = api_post(f"/api/game/rpg/{room_id}/action", {
+                        "room_id": room_id, "user_id": USER_ID, "target": target,
+                    })
+                    if result and result.get("status") == "action_received":
+                        st.success(f"Phiếu đã gửi: {target}")
+                        st.rerun()
+                    elif result:
+                        st.error(result.get("error", "Error"))
+
+            elif phase == "DAY_DISCUSSION":
+                st.caption("Đang thảo luận... Gamemaster sẽ mở phiếu bầu.")
+
+            elif phase == "FINISHED":
+                st.success("Trò chơi đã kết thúc! Xem kết quả trong chat.")
+                if st.button("🎮 Chơi lại", key="rpg_restart", use_container_width=True):
+                    result = api_post("/api/game/rpg/start", {
+                        "user_id": USER_ID, "user_name": USER_NAME,
+                    })
+                    if result and result.get("status") == "started":
+                        st.rerun()
+
+        else:
+            # ---- Trivia UI (original) ----
+            question = active_game.get("question", "")
+            reward = active_game.get("reward", 5)
+
+            st.info(f"**Trivia (Room #{room_id})** — {reward} ⚡ at stake!")
+            st.markdown(f"**Question:** {question}")
+
+            with st.form("answer_form", clear_on_submit=True):
+                answer_input = st.text_input("Your answer", placeholder="Type your answer...")
+                answer_submitted = st.form_submit_button("Submit Answer", use_container_width=True)
+
+            if answer_submitted and answer_input:
+                result = api_post("/api/game/answer", {
+                    "room_id": room_id, "user_id": USER_ID, "answer": answer_input,
+                })
+                if result and result.get("status") == "answered":
+                    if result["result"] == "correct":
+                        st.success(f"Correct! +{result['reward']} ⚡ Catalyst Points!")
+                        st.balloons()
+                    else:
+                        st.error(f"Wrong! The answer was: **{result['correct_answer']}**")
+                    st.rerun()
+                elif result:
+                    st.error(result.get("detail", "Error"))
     else:
-        st.caption("No active game. Start a new trivia challenge!")
-        if st.button("🎲 Start Trivia", use_container_width=True):
-            result = api_post("/api/game/start", {
-                "user_id": USER_ID, "user_name": USER_NAME,
-            })
-            if result and result.get("status") == "started":
-                st.rerun()
-            else:
-                st.error("Could not start game.")
+        st.caption("No active game. Choose a game mode to start!")
+        col_trivia, col_rpg = st.columns(2)
+        with col_trivia:
+            if st.button("🎲 Start Trivia", use_container_width=True):
+                result = api_post("/api/game/start", {
+                    "user_id": USER_ID, "user_name": USER_NAME,
+                })
+                if result and result.get("status") == "started":
+                    st.rerun()
+                else:
+                    st.error("Could not start game.")
+        with col_rpg:
+            if st.button("🐺 Start Ma Sói RPG", use_container_width=True):
+                result = api_post("/api/game/rpg/start", {
+                    "user_id": USER_ID, "user_name": USER_NAME,
+                })
+                if result and result.get("status") == "started":
+                    st.toast(f"Vai của bạn: {result.get('role_emoji','')} {result.get('role_label','')}")
+                    st.rerun()
+                else:
+                    st.error("Could not start Ma Sói game.")
 
 
 # ===================== TAB 5: GOALS & TASKS =====================

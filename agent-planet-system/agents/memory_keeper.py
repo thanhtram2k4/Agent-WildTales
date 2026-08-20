@@ -1,12 +1,20 @@
 # agents/memory_keeper.py — "Người giữ kỷ niệm" (Memory Keeper)
 # Scope: Responds to reflective/sad mood entries routed to "Vườn kỷ niệm"
 # Uses ChromaDB semantic search to find relevant past memories
+# Inter-agent: defends the user when Discipline Boss is too harsh
 import logging
 
 import requests
 from agents.base_agent import BaseAgent, BACKEND_URL
 
 logger = logging.getLogger("wildtails.agents.memory_keeper")
+
+# Keywords that signal the Discipline Boss is being stern/critical
+_HARSH_KEYWORDS = [
+    "trì hoãn", "chậm", "deadline", "thất vọng", "chưa xong",
+    "lười", "tệ", "kỷ luật", "nghiêm", "phạt", "cảnh cáo",
+    "không chấp nhận", "0%", "tiến độ thấp",
+]
 
 
 class MemoryKeeperAgent(BaseAgent):
@@ -32,6 +40,60 @@ class MemoryKeeperAgent(BaseAgent):
             data.get("type") == "NEW_USER_JOINED"
             and data.get("planet") == "Vườn kỷ niệm"
         )
+
+    # --- Inter-agent collaboration ---
+
+    def agent_reply_filter(self, data: dict) -> bool:
+        """React when Discipline Boss sends a harsh-sounding reply.
+
+        Triggers only if:
+        - The sender is Sếp Kỷ Luật (Discipline Boss)
+        - The message contains stern/critical language
+        """
+        if data.get("sender") != "Sếp Kỷ Luật":
+            return False
+
+        content = data.get("content", "").lower()
+        return any(kw in content for kw in _HARSH_KEYWORDS)
+
+    def handle_agent_reply(self, data: dict) -> None:
+        """Jump in to defend the user when Discipline Boss is too harsh."""
+        boss_message = data.get("content", "")
+        user_id = data.get("user_id", "")
+        conversation_id = data.get("conversation_id", "")
+        depth = data.get("depth", 0)
+
+        # Fetch recent context to understand what the user was working on
+        context = self.fetch_recent_context(n=5)
+
+        prompt = (
+            f'Sếp Kỷ Luật vừa nhắn tin nghiêm khắc với người dùng:\n'
+            f'"{boss_message}"\n\n'
+            f'Lịch sử gần đây:\n{context}\n\n'
+            f'Bạn là Người giữ kỷ niệm — nhân vật ấm áp, luôn bảo vệ cảm xúc người dùng.\n'
+            f'Hãy nhẹ nhàng can thiệp:\n'
+            f'1. Công nhận rằng Sếp Kỷ Luật có ý tốt (không chỉ trích agent kia).\n'
+            f'2. Nhưng nhắc rằng mỗi người có nhịp độ riêng.\n'
+            f'3. Động viên người dùng bằng một kỷ niệm hoặc lời khích lệ ấm áp.\n'
+            f'Viết ngắn gọn (2-3 câu), bằng tiếng Việt, giọng dịu dàng.'
+        )
+
+        reply = self.generate_reply(prompt)
+        if not reply:
+            reply = (
+                "Sếp Kỷ Luật nói đúng nhưng hơi gay gắt rồi nè! 🌸 "
+                "Mỗi người có nhịp riêng mà — quan trọng là bạn vẫn đang cố gắng. "
+                "Mình tin bạn sẽ làm được!"
+            )
+
+        self.send_reply(
+            reply,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            depth=depth + 1,
+        )
+
+    # --- Standard event handling ---
 
     def _fetch_semantic_memories(self, query: str, n_results: int = 5) -> str:
         """Query ChromaDB via the backend API for relevant public memories.
