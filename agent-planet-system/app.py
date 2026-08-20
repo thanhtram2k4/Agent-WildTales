@@ -183,6 +183,25 @@ def init_db():
             except sqlite3.OperationalError:
                 pass
 
+        # --- Event Participations table (Step 3: RSVP & Gamification) ---
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS event_participations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'interested'
+                    CHECK(status IN ('interested', 'attended')),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Unique constraint: one participation record per (user_id, event_id)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_event_participation_uniq
+            ON event_participations (user_id, event_id)
+        """)
+
 
 @app.on_event("startup")
 async def startup():
@@ -462,6 +481,23 @@ async def mood_and_planet_recommender(text: str) -> dict:
         logger.warning("[MoodRouter] Exception during mood analysis: %s", e)
         return fallback
 
+def _fetch_active_goals(user_id: str) -> list[dict]:
+    """Fetch in-progress goals for a user (used by proactive Event Scout gate)."""
+    try:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT title, progress, target_date FROM goals "
+                "WHERE user_id = ? AND status = 'in_progress' LIMIT 10",
+                (user_id,),
+            ).fetchall()
+        return [
+            {"title": r["title"], "progress": r["progress"], "target_date": r["target_date"] or ""}
+            for r in rows
+        ]
+    except Exception:
+        return []
+
+
 # 2. API nhận chat từ User
 @app.post("/api/chat")
 async def chat_interaction(payload: UserMessage):
@@ -552,6 +588,23 @@ async def chat_interaction(payload: UserMessage):
             "visibility": "public",
         }
         await event_bridge.broadcast(new_msg_event)
+
+        # --- Proactive Event Scout: goal-aware matching ---
+        # Check if the journal entry signals interest in events/networking/learning.
+        # If so, emit EVENT_MATCH_REQUEST with the user's active goals as context.
+        from agents.event_matcher import should_match_events
+        active_goals = _fetch_active_goals(payload.user_id)
+        if should_match_events(payload.message, active_goals):
+            event_match_payload = {
+                "event_id": str(uuid.uuid4()),
+                "type": "EVENT_MATCH_REQUEST",
+                "user_id": payload.user_id,
+                "conversation_id": conversation_id,
+                "user": payload.user_name,
+                "query": payload.message,
+                "active_goals": active_goals,
+            }
+            await event_bridge.broadcast(event_match_payload)
 
         # Legacy subscriber support (tests)
         for queue in subscribers:
@@ -838,6 +891,8 @@ class VectorSearchRequest(BaseModel):
     n_results: int = 5
     user_id: str = ""
     include_private: bool = False
+    planet: str = ""       # optional planet filter (e.g., "Hành tinh mặt trời")
+    owner_only: bool = False  # restrict to entries owned by user_id
 
 
 @app.post("/api/memory/search")
@@ -851,6 +906,8 @@ async def search_memory(payload: VectorSearchRequest):
         n_results=payload.n_results,
         user_id=payload.user_id,
         include_private=payload.include_private,
+        planet=payload.planet or None,
+        owner_only=payload.owner_only,
     )
     return {"results": results}
 
@@ -1344,6 +1401,87 @@ async def rpg_player_action(room_id: int, payload: RPGActionRequest):
     await event_bridge.broadcast(rpg_action_event)
 
     return {"status": "action_received", "action": action_type, "target": payload.target}
+
+
+# 7d. Event Participation API (Step 3: RSVP & Gamification)
+class EventParticipationRequest(BaseModel):
+    user_id: str
+    event_id: str
+    status: str = "interested"  # "interested" or "attended"
+
+
+@app.post("/api/events/participation")
+async def upsert_event_participation(payload: EventParticipationRequest):
+    """Create or update an event participation record.
+
+    When status changes to 'attended', awards +8 Catalyst Points exactly once
+    via idempotent TokenService (reference_type='event_attendance').
+    """
+    if payload.status not in ("interested", "attended"):
+        return {"status": "error", "detail": "Status must be 'interested' or 'attended'"}
+
+    with get_db() as conn:
+        # Check for existing record
+        existing = conn.execute(
+            "SELECT id, status FROM event_participations WHERE user_id = ? AND event_id = ?",
+            (payload.user_id, payload.event_id),
+        ).fetchone()
+
+        if existing:
+            old_status = existing["status"]
+            if old_status == payload.status:
+                return {"status": "unchanged", "participation_status": payload.status}
+            conn.execute(
+                "UPDATE event_participations SET status = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE user_id = ? AND event_id = ?",
+                (payload.status, payload.user_id, payload.event_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO event_participations (user_id, event_id, status) VALUES (?, ?, ?)",
+                (payload.user_id, payload.event_id, payload.status),
+            )
+
+    # Award tokens exactly once when status changes to 'attended'
+    token_result = None
+    if payload.status == "attended":
+        token_result = token_service.award(
+            user_id=payload.user_id,
+            amount=8,
+            reason=f"Event attendance: {payload.event_id}",
+            reference_type="event_attendance",
+            reference_id=payload.event_id,
+        )
+
+    return {
+        "status": "success",
+        "participation_status": payload.status,
+        "token_award": token_result["status"] if token_result else None,
+        "token_balance": token_result["balance"] if token_result else None,
+    }
+
+
+@app.get("/api/events/participation/{user_id}")
+async def get_event_participations(user_id: str):
+    """Get all event participation records for a user."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, event_id, status, created_at, updated_at "
+            "FROM event_participations WHERE user_id = ? ORDER BY updated_at DESC",
+            (user_id,),
+        ).fetchall()
+    return {
+        "participations": [
+            {
+                "id": r["id"],
+                "event_id": r["event_id"],
+                "status": r["status"],
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        ]
+    }
 
 
 # 8. Token / Catalyst Points API (Phase G - Gamification)

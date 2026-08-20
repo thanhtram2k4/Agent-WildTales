@@ -95,11 +95,38 @@ class MemoryKeeperAgent(BaseAgent):
 
     # --- Standard event handling ---
 
-    def _fetch_semantic_memories(self, query: str, n_results: int = 5) -> str:
-        """Query ChromaDB via the backend API for relevant public memories.
+    # --- Tiered retrieval ---
 
-        Community agents only search public entries — private journals
-        are never exposed to agents.
+    def _fetch_personal_memories(self, query: str, user_id: str, n_results: int = 3) -> str:
+        """Tier 1: Search for positive / Sun Planet memories belonging to the current user.
+
+        Uses the backend /api/memory/search with planet filter.
+        include_private is False — agents never see Captain's Cabin entries.
+        """
+        try:
+            resp = requests.post(
+                f"{BACKEND_URL}/api/memory/search",
+                json={
+                    "query": query,
+                    "n_results": n_results,
+                    "user_id": user_id,
+                    "include_private": False,
+                    "planet": "Hành tinh mặt trời",
+                    "owner_only": True,
+                },
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                results = resp.json().get("results", [])
+                return self._format_memories(results) if results else ""
+        except Exception as e:
+            logger.warning("[%s] Personal memory search failed: %s", self.agent_name, e)
+        return ""
+
+    def _fetch_community_memories(self, query: str, n_results: int = 5) -> str:
+        """Tier 2: Fallback to community public memories (no private data).
+
+        Used when the user has no personal positive memories to draw on.
         """
         try:
             resp = requests.post(
@@ -114,15 +141,19 @@ class MemoryKeeperAgent(BaseAgent):
             )
             if resp.status_code == 200:
                 results = resp.json().get("results", [])
-                if results:
-                    lines = []
-                    for r in results:
-                        user = r.get("metadata", {}).get("user_name", "ai đó")
-                        lines.append(f"[{user}]: {r['document']}")
-                    return "\n".join(lines)
+                return self._format_memories(results) if results else ""
         except Exception as e:
-            logger.warning("[%s] Semantic memory search failed: %s", self.agent_name, e)
+            logger.warning("[%s] Community memory search failed: %s", self.agent_name, e)
         return ""
+
+    @staticmethod
+    def _format_memories(results: list[dict]) -> str:
+        """Format memory search results into readable lines."""
+        lines = []
+        for r in results:
+            user = r.get("metadata", {}).get("user_name", "ai đó")
+            lines.append(f"[{user}]: {r['document']}")
+        return "\n".join(lines)
 
     def handle_event(self, data: dict) -> None:
         user_name = data.get("user", "bạn")
@@ -130,19 +161,32 @@ class MemoryKeeperAgent(BaseAgent):
         conversation_id = data.get("conversation_id", "")
         message = data.get("message", "")
 
-        # Try semantic search first — find memories related to the user's current message
         search_query = message or f"{user_name} buồn hoài niệm Vườn kỷ niệm"
-        semantic_memories = self._fetch_semantic_memories(search_query, n_results=5)
 
-        # Fall back to recent chat context if no semantic results
-        if not semantic_memories:
-            semantic_memories = self.fetch_recent_context(n=10)
+        # Tier 1: Personal positive / Sun Planet memories for this user
+        personal_memories = self._fetch_personal_memories(search_query, user_id, n_results=3)
+
+        # Tier 2: Fallback to community memories if personal context is empty
+        community_memories = ""
+        if not personal_memories:
+            community_memories = self._fetch_community_memories(search_query, n_results=5)
+
+        # Fall back to recent chat context if both tiers are empty
+        if not personal_memories and not community_memories:
+            community_memories = self.fetch_recent_context(n=10)
 
         prompt = f"Người dùng tên '{user_name}' vừa bước vào Vườn kỷ niệm với tâm trạng buồn/hoài niệm."
-        if semantic_memories:
-            prompt += f"\n\nKý ức liên quan từ cộng đồng:\n---\n{semantic_memories}\n---"
-            prompt += "\nHãy chào đón họ với sự đồng cảm, và nếu phù hợp, chia sẻ ký ức cộng đồng để tạo sự đồng điệu."
-        else:
+        if personal_memories:
+            prompt += (
+                f"\n\nKý ức cá nhân tích cực của họ:\n---\n{personal_memories}\n---"
+                "\nHãy nhắc họ về những khoảnh khắc tích cực trong quá khứ để động viên tinh thần."
+            )
+        if community_memories:
+            prompt += (
+                f"\n\nKý ức từ cộng đồng:\n---\n{community_memories}\n---"
+                "\nNếu phù hợp, chia sẻ ký ức cộng đồng để tạo sự đồng điệu."
+            )
+        if not personal_memories and not community_memories:
             prompt += "\nHãy chào đón họ với sự đồng cảm."
 
         greeting = self.generate_reply(prompt)

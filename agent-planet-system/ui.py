@@ -783,15 +783,22 @@ with tab_events:
             api_post("/api/events/refresh")
             st.rerun()
 
+    # Fetch user's participation records to show current status on each card
+    _participation_data = api_get(f"/api/events/participation/{USER_ID}")
+    _participation_map: dict[str, str] = {}
+    if _participation_data:
+        for p in _participation_data.get("participations", []):
+            _participation_map[p["event_id"]] = p["status"]
+
     events_data = api_get("/api/events")
     events_list = events_data.get("events", []) if events_data else []
 
     if not events_list:
         st.caption("No events loaded. Click Refresh to fetch from Wildcats.io.")
     else:
-        for ev in events_list:
+        for _ev_idx, ev in enumerate(events_list):
             with st.container():
-                c1, c2 = st.columns([3, 1])
+                c1, c2, c3 = st.columns([3, 1, 1])
                 with c1:
                     title = ev.get("title", "Untitled")
                     desc = ev.get("description", "")
@@ -810,4 +817,30 @@ with tab_events:
                         st.markdown(f"📅 {ev['event_date']}")
                     if ev.get("location"):
                         st.markdown(f"📍 {ev['location']}")
+                with c3:
+                    # Use a stable event_id derived from title (same logic as embed)
+                    _event_id = f"event_{title.lower().replace(' ', '_')[:50]}"
+                    _current_status = _participation_map.get(_event_id, "")
+
+                    if _current_status == "attended":
+                        st.markdown(":green[**Attended**]")
+                    elif _current_status == "interested":
+                        st.caption("Interested")
+                        if st.button("Mark Attended", key=f"attend_{_ev_idx}"):
+                            result = api_post("/api/events/participation", {
+                                "user_id": USER_ID,
+                                "event_id": _event_id,
+                                "status": "attended",
+                            })
+                            if result and result.get("token_award") == "awarded":
+                                st.success("+8 Catalyst Points!")
+                            st.rerun()
+                    else:
+                        if st.button("Interested", key=f"interest_{_ev_idx}"):
+                            api_post("/api/events/participation", {
+                                "user_id": USER_ID,
+                                "event_id": _event_id,
+                                "status": "interested",
+                            })
+                            st.rerun()
                 st.divider()
